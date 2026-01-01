@@ -134,7 +134,7 @@ Key Modules:
 
 ### 3. **GSecurity.cmd** (BIOS & Boot Hardening)
 ```cmd
-bcdedit /set nx AlwaysOff            # Disable DEP
+bcdedit /set nx AlwaysOn            # Enable DEP
 bcdedit /set hypervisorlaunchtype off # Disable Hyper-V
 bcdedit /set disableelamdrivers Yes  # Disable Early Launch Anti-Malware
 bcdedit /set useplatformclock false  # Disable platform clock for gaming performance
@@ -252,15 +252,13 @@ reg query "HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DohSetting
 
 ### ⚠️ Important Warnings
 
-1. **System Compatibility**: BIOS tweaks disable hypervisor, DEP, and TPM features. Not recommended for systems requiring virtualization or measured boot.
+1. **Service Disruption**: This toolkit disables critical remote access services (RDP alternatives, file servers, remote registry). Ensure you have local/physical access before deployment.
 
-2. **Service Disruption**: This toolkit disables critical remote access services (RDP alternatives, file servers, remote registry). Ensure you have local/physical access before deployment.
+2. **Certificate Removal**: Removes 50+ root certificates. May break applications/websites that rely on specific CAs.
 
-3. **Certificate Removal**: Removes 50+ root certificates. May break applications/websites that rely on specific CAs.
+3. **Browser Control**: Enforces mandatory extension installation. Users cannot disable or remove policy-managed extensions.
 
-4. **Browser Control**: Enforces mandatory extension installation. Users cannot disable or remove policy-managed extensions.
-
-5. **Performance Impact**: Real-time scanning with 15-second intervals may impact system performance on low-end hardware.
+4. **Performance Impact**: Real-time scanning with 15-second intervals may impact system performance on low-end hardware.
 
 ### Recommended Use Cases
 
@@ -380,9 +378,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **Gorstak**
 
-- GitHub: [@gorstak](https://github.com/gorstak)
-- Version: 6.0.0
-- Last Updated: June 10, 2025
+- GitHub: [@gorstak](https://github.com/ads-blocker)
+- Last Updated: 2026
 
 ---
 
