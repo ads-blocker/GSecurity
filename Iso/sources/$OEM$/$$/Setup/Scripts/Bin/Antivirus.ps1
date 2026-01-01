@@ -11,7 +11,7 @@ param([switch]$Uninstall)
 
 $Script:InstallPath = "C:\ProgramData\AntivirusProtection"
 $Script:ModulesPath = "$Script:InstallPath\Modules"
-$Script:ScriptName = "Antivirus-Core.ps1"
+$Script:ScriptName = "Antivirus.ps1"
 $Script:MaxCacheSize = 10000
 
 $Script:ManagedJobConfig = @{
