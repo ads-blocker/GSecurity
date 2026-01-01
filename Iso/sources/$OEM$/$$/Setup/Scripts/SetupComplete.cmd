@@ -1,10 +1,4 @@
 @echo off
-
-:: Script Metadata
-set "SCRIPT_NAME=GSecurity"
-set "SCRIPT_VERSION=6.0.0"
-set "SCRIPT_UPDATED=06.10.2025"
-set "AUTHOR=Gorstak"
 Title GSecurity && Color 0b
 
 :: Step 1: Elevate
@@ -40,4 +34,5 @@ for /f "tokens=*" %%C in ('dir /b /o:n *.reg') do (
 )
 
 echo Script completed successfully.
+
 exit
