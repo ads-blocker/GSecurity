@@ -2,7 +2,7 @@
 
 :: Bios tweaks
 set bcd=%windir%\system32\bcdedit.exe
-%bcd% /set nx AlwaysOff
+%bcd% /set nx AlwaysOn
 %bcd% /set ems No
 %bcd% /set bootems No
 %bcd% /set integrityservices disable
@@ -27,4 +27,5 @@ set bcd=%windir%\system32\bcdedit.exe
 %bcd% /set disabledynamictick yes
 %bcd% /set x2apicpolicy disable
 %bcd% /set uselegacyapicmode yes
+
 
