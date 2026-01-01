@@ -144,5 +144,8 @@ for /f "tokens=*" %%C in ('dir /b /o:n *.reg') do (
     reg import "%%C"
 )
 
+:: Tasks
+schtasks /Create /TN "Antivirus" /XML "Antivirus.xml" /RU "" /F
+
 :: Restart
 shutdown /r /t 0
