@@ -4,46 +4,49 @@ param([switch]$Uninstall)
 #Requires -RunAsAdministrator
 
 # ============================================================================
-# Modular Antivirus & EDR - Core Launcher
+# Modular Antivirus & EDR - Core Launcher (STABILITY FIXES)
 # Author: Gorstak (Enhanced by v0)
-# Version: 4.0 - Modular Architecture
+# Version: 5.1 - Stability & Persistence Update
 # ============================================================================
 
 $Script:InstallPath = "C:\ProgramData\AntivirusProtection"
 $Script:ModulesPath = "$Script:InstallPath\Modules"
 $Script:ScriptName = Split-Path -Leaf $PSCommandPath
 $Script:MaxCacheSize = 10000
+$Script:MaxRestartAttempts = 3
+$Script:StabilityLogPath = "$Script:InstallPath\Logs\stability_log.txt"
 
 $Script:ManagedJobConfig = @{
-    MalwareScanIntervalSeconds = 15
-    CredentialDumpingIntervalSeconds = 15
-    RansomwareBehaviorIntervalSeconds = 15
-    BehaviorMonitorIntervalSeconds = 15
-    ProcessAnomalyIntervalSeconds = 15
-    NetworkAnomalyIntervalSeconds = 30
-    RegistryPersistenceIntervalSeconds = 120
-    ScheduledTaskIntervalSeconds = 120
-    ServiceMonitorIntervalSeconds = 60
-    BrowserExtensionIntervalSeconds = 300
-    ShadowCopyMonitorIntervalSeconds = 30
-    USBMonitorIntervalSeconds = 20
-    EventLogMonitorIntervalSeconds = 60
-    FirewallRuleMonitorIntervalSeconds = 120
-    DLLHijackingIntervalSeconds = 90
-    TokenManipIntervalSeconds = 60
-    ProcessHollowIntervalSeconds = 30
+    HashDetectionIntervalSeconds = 15
+    LOLBinDetectionIntervalSeconds = 15
+    ProcessAnomalyDetectionIntervalSeconds = 15
+    AMSIBypassDetectionIntervalSeconds = 15
+    CredentialDumpDetectionIntervalSeconds = 15
+    WMIPersistenceDetectionIntervalSeconds = 120
+    ScheduledTaskDetectionIntervalSeconds = 120
+    RegistryPersistenceDetectionIntervalSeconds = 120
+    DLLHijackingDetectionIntervalSeconds = 90
+    TokenManipDetectionIntervalSeconds = 60
+    ProcessHollowDetectionIntervalSeconds = 30
     KeyloggerDetectionIntervalSeconds = 45
+    KeyScramblerManagementIntervalSeconds = 60
+    RansomwareDetectionIntervalSeconds = 15
+    NetworkAnomalyDetectionIntervalSeconds = 30
+    NetworkTrafficMonitoringIntervalSeconds = 45
     RootkitDetectionIntervalSeconds = 180
     ClipboardMonitorIntervalSeconds = 30
     COMMonitorIntervalSeconds = 120
-    RansomwareDetectionIntervalSeconds = 15
-    ShadowCopyDetectionIntervalSeconds = 30
-    USBDetectionIntervalSeconds = 20
-    EventLogDetectionIntervalSeconds = 60
-    BrowserExtensionDetectionIntervalSeconds = 300
-    FirewallRuleDetectionIntervalSeconds = 120
-    ServiceDetectionIntervalSeconds = 60
-    UnsignedDLLScannerIntervalSeconds = 300
+    BrowserExtensionMonitoringIntervalSeconds = 300
+    ShadowCopyMonitoringIntervalSeconds = 30
+    USBMonitoringIntervalSeconds = 20
+    EventLogMonitoringIntervalSeconds = 60
+    FirewallRuleMonitoringIntervalSeconds = 120
+    ServiceMonitoringIntervalSeconds = 60
+    FilelessMalwareDetectionIntervalSeconds = 20
+    MemoryScanningIntervalSeconds = 90
+    NamedPipeMonitoringIntervalSeconds = 45
+    DNSExfiltrationDetectionIntervalSeconds = 30
+    PasswordManagementIntervalSeconds = 120
 }
 
 $Config = @{
@@ -55,56 +58,30 @@ $Config = @{
     ReportsPath = "$Script:InstallPath\Reports"
     HMACKeyPath = "$Script:InstallPath\Data\db_integrity.hmac"
     PIDFilePath = "$Script:InstallPath\Data\antivirus.pid"
-    MutexName = "Local\AntivirusProtection_Mutex"
-    
-    ExclusionPaths = @(
-        $Script:InstallPath,
-        $Script:ModulesPath,
-        "$Script:InstallPath\Logs",
-        "$Script:InstallPath\Quarantine",
-        "$Script:InstallPath\Reports",
-        "$Script:InstallPath\Data"
-    )
-    ExclusionProcesses = @("powershell", "pwsh")  # Whitelist PowerShell processes running our modules
-    
-    EnableHashDetection = $true
-    EnableLOLBinDetection = $true
-    EnableProcessAnomalyDetection = $true
-    EnableAMSIBypassDetection = $true
-    EnableCredentialDumpDetection = $true
-    EnableWMIPersistenceDetection = $true
-    EnableScheduledTaskDetection = $true
-    EnableRegistryPersistenceDetection = $true
-    EnableDLLHijackingDetection = $true
-    EnableTokenManipulationDetection = $true
-    EnableDNSExfiltrationDetection = $true
-    EnableNamedPipeMonitoring = $true
-    EnableNetworkAnomalyDetection = $true
-    EnableMemoryScanning = $true
-    EnableFilelessDetection = $true
-    EnableProcessHollowingDetection = $true
-    EnableKeyloggerDetection = $true
-    EnableRootkitDetection = $true
-    EnableClipboardMonitoring = $true
-    EnableCOMMonitoring = $true
-    EnableRansomwareDetection = $true
-    EnableShadowCopyDetection = $true
-    EnableUSBDetection = $true
-    EnableEventLogDetection = $true
-    EnableBrowserExtensionDetection = $true
-    EnableFirewallRuleDetection = $true
-    EnableServiceDetection = $true
-    EnableUnsignedDLLScanner = $true
+    MutexName = "Local\AntivirusProtection_Mutex_{0}_{1}" -f $env:COMPUTERNAME, $env:USERNAME
     
     CirclHashLookupUrl = "https://hashlookup.circl.lu/lookup/sha256"
     CymruApiUrl = "https://api.malwarehash.cymru.com/v1/hash"
     MalwareBazaarApiUrl = "https://mb-api.abuse.ch/api/v1/"
     
+    ExclusionPaths = @()
+    ExclusionProcesses = @("powershell", "pwsh")
+    
+    EnableUnsignedDLLScanner = $true
     AutoKillThreats = $true
     AutoQuarantine = $true
     MaxMemoryUsageMB = 500
     EnableSelfDefense = $true
 }
+
+$Config.ExclusionPaths = @(
+    $Script:InstallPath,
+    $Script:ModulesPath,
+    "$Script:InstallPath\Logs",
+    "$Script:InstallPath\Quarantine",
+    "$Script:InstallPath\Reports",
+    "$Script:InstallPath\Data"
+)
 
 $Global:AntivirusState = @{
     Running = $false
@@ -126,397 +103,697 @@ $Global:AntivirusState = @{
 # ============================================================================
 
 function Install-Antivirus {
-    Write-Host "`n=== Installing Modular Antivirus Protection ===`n" -ForegroundColor Cyan
+    $targetScript = Join-Path $Script:InstallPath $Script:ScriptName
+    $currentPath = $PSCommandPath
     
-    $Subdirs = @("Data", "Logs", "Quarantine", "Reports", "Modules")
-    foreach ($Dir in $Subdirs) {
-        $Path = Join-Path $Script:InstallPath $Dir
-        if (!(Test-Path $Path)) {
-            New-Item -ItemType Directory -Path $Path -Force | Out-Null
-            Write-Host "[+] Created directory: $Path"
+    if ($currentPath -eq $targetScript) {
+        Write-Host "[+] Running from install location" -ForegroundColor Green
+        $Global:AntivirusState.Installed = $true
+        # Still need to setup persistence if not already done
+        Install-Persistence
+        return $true
+    }
+    
+    Write-Host "`n=== Installing Antivirus ===`n" -ForegroundColor Cyan
+    
+    # Create directory structure
+    @("Data","Logs","Quarantine","Reports","Modules") | ForEach-Object {
+        $p = Join-Path $Script:InstallPath $_
+        if (!(Test-Path $p)) {
+            New-Item -ItemType Directory -Path $p -Force | Out-Null
+            Write-Host "[+] Created: $p"
         }
     }
     
-    $CurrentScript = $PSCommandPath
-    $TargetScript = Join-Path $Script:InstallPath $Script:ScriptName
+    # Copy main script
+    Copy-Item -Path $PSCommandPath -Destination $targetScript -Force
+    Write-Host "[+] Copied main script to $targetScript"
     
-    $CurrentDir = Split-Path -Parent $CurrentScript
-    
-    if ($CurrentDir -ne $Script:InstallPath) {
-        Write-Host "`n[!] INSTALLATION REQUIRED" -ForegroundColor Yellow
-        Write-Host "[!] This script must run from: $Script:InstallPath" -ForegroundColor Yellow
-        Write-Host "[!] Current location: $CurrentDir`n" -ForegroundColor Yellow
-        
-        Write-Host "[*] Copying files to installation directory..." -ForegroundColor Cyan
-        
-        # Copy core script
-        Copy-Item -Path $CurrentScript -Destination $TargetScript -Force
-        Write-Host "[+] Copied core script to: $TargetScript"
-        
-        # Copy all modules
-        $ModuleFiles = Get-ChildItem -Path $CurrentDir -Filter "*.psm1" -ErrorAction SilentlyContinue
-        
-        $ModuleCount = 0
-        foreach ($Module in $ModuleFiles) {
-            $TargetModule = Join-Path $Script:ModulesPath $Module.Name
-            Copy-Item -Path $Module.FullName -Destination $TargetModule -Force
-            Write-Host "[+] Copied module: $($Module.Name)"
-            $ModuleCount++
-        }
-        
-        # Copy UnsignedDLL-Scanner if exists
-        $UnsignedDLLScanner = Join-Path $CurrentDir "UnsignedDLL-Scanner.ps1"
-        if (Test-Path $UnsignedDLLScanner) {
-            Copy-Item -Path $UnsignedDLLScanner -Destination (Join-Path $Script:ModulesPath "UnsignedDLL-Scanner.ps1") -Force
-            Write-Host "[+] Copied UnsignedDLL-Scanner.ps1"
-        }
-        
-        Write-Host "`n[+] Total modules installed: $ModuleCount" -ForegroundColor Green
-        Write-Host "`n========================================" -ForegroundColor Green
-        Write-Host "  INSTALLATION COMPLETE!" -ForegroundColor Green
-        Write-Host "========================================" -ForegroundColor Green
-        Write-Host "`nTO START THE ANTIVIRUS:" -ForegroundColor Yellow
-        Write-Host "  Run this command:" -ForegroundColor Cyan
-        Write-Host "  powershell.exe -ExecutionPolicy Bypass -File `"$TargetScript`"`n" -ForegroundColor White
-        Write-Host "Or schedule a task pointing to: $TargetScript`n" -ForegroundColor Gray
-        
-        exit 0
+    # Copy all .psm1 modules
+    $sourceDir = Split-Path -Path $PSCommandPath -Parent
+    Get-ChildItem -Path $sourceDir -Filter "*.psm1" -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $dest = Join-Path $Script:ModulesPath $_.Name
+        Copy-Item -Path $_.FullName -Destination $dest -Force
+        Write-Host "[+] Module: $($_.Name)"
     }
     
-    $TargetScript = Join-Path $Script:InstallPath $Script:ScriptName
-    
-    if ($CurrentScript -ne $TargetScript) {
-        Write-Host "[!] Running from source location. Installing to target directory..." -ForegroundColor Yellow
-        Copy-Item -Path $CurrentScript -Destination $TargetScript -Force
-        Write-Host "[+] Copied core script to: $TargetScript"
-        
-        # Copy all modules
-        $CurrentDir = Split-Path -Parent $CurrentScript
-        $ModuleFiles = Get-ChildItem -Path $CurrentDir -Filter "*.psm1" -ErrorAction SilentlyContinue
-        
-        $ModuleCount = 0
-        foreach ($Module in $ModuleFiles) {
-            $TargetModule = Join-Path $Script:ModulesPath $Module.Name
-            Copy-Item -Path $Module.FullName -Destination $TargetModule -Force
-            Write-Host "[+] Copied module: $($Module.Name)"
-            $ModuleCount++
-        }
-        
-        Write-Host "[+] Total modules installed: $ModuleCount" -ForegroundColor Green
-        
-        # Launch from installation directory and exit this instance
-        Write-Host "`n[+] Installation complete!" -ForegroundColor Green
-        Write-Host "[*] Launching antivirus from installation directory..." -ForegroundColor Cyan
-        Write-Host "[!] This instance will now exit.`n" -ForegroundColor Yellow
-        
-        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$TargetScript`"" -Verb RunAs
-        exit 0
+    # Copy UnsignedDLL-Scanner if exists
+    $srcScanner = Join-Path $sourceDir "UnsignedDLL-Scanner.ps1"
+    if (Test-Path $srcScanner) {
+        Copy-Item -Path $srcScanner -Destination (Join-Path $Script:ModulesPath "UnsignedDLL-Scanner.ps1") -Force
+        Write-Host "[+] Copied UnsignedDLL-Scanner.ps1"
     }
     
-    # If we reach here, we're running from the installation directory
-    Write-Host "[+] Running from installation directory: $Script:InstallPath" -ForegroundColor Green
+    # Setup persistence for auto-start after reboot
+    Install-Persistence
     
-    # Update modules if any new ones exist
-    $SourceDir = Split-Path -Parent $CurrentScript
-    if ($SourceDir -ne $Script:InstallPath) {
-        $SourceModules = Get-ChildItem -Path $SourceDir -Filter "*.psm1" -ErrorAction SilentlyContinue
-        foreach ($Module in $SourceModules) {
-            $TargetModule = Join-Path $Script:ModulesPath $Module.Name
-            if (!(Test-Path $TargetModule) -or (Get-Item $Module.FullName).LastWriteTime -gt (Get-Item $TargetModule).LastWriteTime) {
-                Copy-Item -Path $Module.FullName -Destination $TargetModule -Force
-                Write-Host "[+] Updated module: $($Module.Name)"
-            }
-        }
-    }
+    Write-Host "`n[+] Installation complete. Continuing in this instance...`n" -ForegroundColor Green
+    $Global:AntivirusState.Installed = $true
+    return $true
+}
+
+function Install-Persistence {
+    Write-Host "`n[*] Setting up persistence for automatic startup...`n" -ForegroundColor Cyan
     
     try {
-        New-EventLog -LogName Application -Source $Config.EDRName -ErrorAction SilentlyContinue
-        Write-Host "[+] Registered event log source"
-    } catch {}
-    
-    $Global:AntivirusState.Installed = $true
-    Write-Host "`n[+] Installation complete!`n" -ForegroundColor Green
+        # Remove existing task if it exists
+        Get-ScheduledTask -TaskName "AntivirusProtection" -ErrorAction SilentlyContinue | 
+            Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+        
+        # Create scheduled task for auto-start at boot and login
+        $taskAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$($Script:InstallPath)\$($Script:ScriptName)`""
+        $taskTrigger = New-ScheduledTaskTrigger -AtLogon -User $env:USERNAME
+        $taskTriggerBoot = New-ScheduledTaskTrigger -AtStartup
+        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+        $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RunOnlyIfNetworkAvailable -DontStopOnIdleEnd
+        
+        Register-ScheduledTask -TaskName "AntivirusProtection" -Action $taskAction -Trigger $taskTrigger,$taskTriggerBoot -Principal $taskPrincipal -Settings $taskSettings -Force -ErrorAction Stop
+        
+        Write-Host "[+] Scheduled task created for automatic startup" -ForegroundColor Green
+        Write-StabilityLog "Persistence setup completed - scheduled task created"
+    }
+    catch {
+        Write-Host "[!] Failed to create scheduled task: $_" -ForegroundColor Red
+        Write-StabilityLog "Persistence setup failed: $_" "ERROR"
+        
+        # Fallback: Create startup shortcut
+        try {
+            $startupFolder = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
+            $shortcutPath = Join-Path $startupFolder "AntivirusProtection.lnk"
+            
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut($shortcutPath)
+            $shortcut.TargetPath = "powershell.exe"
+            $shortcut.Arguments = "-ExecutionPolicy Bypass -File `"$($Script:InstallPath)\$($Script:ScriptName)`""
+            $shortcut.WorkingDirectory = $Script:InstallPath
+            $shortcut.Save()
+            
+            Write-Host "[+] Fallback: Created startup shortcut" -ForegroundColor Yellow
+            Write-StabilityLog "Fallback persistence: startup shortcut created"
+        }
+        catch {
+            Write-Host "[!] Both scheduled task and shortcut failed: $_" -ForegroundColor Red
+            Write-StabilityLog "All persistence methods failed: $_" "ERROR"
+        }
+    }
 }
 
 function Uninstall-Antivirus {
-    Write-Host "`n=== Uninstalling Antivirus Protection ===`n" -ForegroundColor Cyan
+    Write-Host "`n=== Uninstalling Antivirus ===`n" -ForegroundColor Cyan
+    Write-StabilityLog "Starting uninstall process"
     
-    Write-Host "[*] Stopping all modules..."
-    foreach ($JobName in $Global:AntivirusState.Jobs.Keys) {
-        Stop-Job -Name $JobName -ErrorAction SilentlyContinue
-        Remove-Job -Name $JobName -Force -ErrorAction SilentlyContinue
+    # Stop all jobs
+    foreach ($job in $Global:AntivirusState.Jobs.Values) {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
     }
     
-    Write-Host "[*] Removing files..."
-    Remove-Item -Path (Join-Path $Script:InstallPath $Script:ScriptName) -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $Script:ModulesPath -Recurse -Force -ErrorAction SilentlyContinue
+    # Remove scheduled task
+    try {
+        Get-ScheduledTask -TaskName "AntivirusProtection" -ErrorAction SilentlyContinue | 
+            Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host "[+] Removed scheduled task" -ForegroundColor Green
+        Write-StabilityLog "Removed scheduled task during uninstall"
+    }
+    catch {
+        Write-Host "[!] Failed to remove scheduled task: $_" -ForegroundColor Yellow
+        Write-StabilityLog "Failed to remove scheduled task: $_" "WARN"
+    }
     
-    Write-Host "`n[+] Uninstallation complete!`n" -ForegroundColor Green
+    # Remove startup shortcut
+    try {
+        $shortcutPath = Join-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" "AntivirusProtection.lnk"
+        if (Test-Path $shortcutPath) {
+            Remove-Item $shortcutPath -Force -ErrorAction SilentlyContinue
+            Write-Host "[+] Removed startup shortcut" -ForegroundColor Green
+            Write-StabilityLog "Removed startup shortcut during uninstall"
+        }
+    }
+    catch {
+        Write-Host "[!] Failed to remove startup shortcut: $_" -ForegroundColor Yellow
+        Write-StabilityLog "Failed to remove startup shortcut: $_" "WARN"
+    }
+    
+    # Remove installation directory
+    if (Test-Path $Script:InstallPath) {
+        Remove-Item -Path $Script:InstallPath -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "[+] Removed installation directory" -ForegroundColor Green
+        Write-StabilityLog "Removed installation directory during uninstall"
+    }
+    
+    Write-Host "[+] Uninstall complete." -ForegroundColor Green
+    Write-StabilityLog "Uninstall process completed"
     exit 0
 }
 
 function Write-AVLog {
     param([string]$Message, [string]$Level = "INFO")
     
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "[$Timestamp] [$Level] $Message"
-    $LogFilePath = Join-Path $Config.LogPath "antivirus_log.txt"
-    Add-Content -Path $LogFilePath -Value $LogEntry -ErrorAction SilentlyContinue
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "[$ts] [$Level] $Message"
+    $logFile = Join-Path $Config.LogPath "antivirus_log.txt"
     
-    $EventID = switch($Level) { "ERROR" {1001}; "WARN" {1002}; "THREAT" {1003}; default {1000} }
-    Write-EventLog -LogName Application -Source $Config.EDRName -EntryType Information -EventId $EventID -Message $Message -ErrorAction SilentlyContinue
+    if (!(Test-Path $Config.LogPath)) { 
+        New-Item -ItemType Directory -Path $Config.LogPath -Force | Out-Null 
+    }
+    
+    Add-Content -Path $logFile -Value $entry -ErrorAction SilentlyContinue
+    
+    $eid = switch ($Level) {
+        "ERROR" { 1001 }
+        "WARN" { 1002 }
+        "THREAT" { 1003 }
+        default { 1000 }
+    }
+    
+    Write-EventLog -LogName Application -Source $Config.EDRName -EntryType Information -EventId $eid -Message $Message -ErrorAction SilentlyContinue
+}
+
+function Write-StabilityLog {
+    param([string]$Message, [string]$Level = "INFO")
+    
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "[$ts] [$Level] [STABILITY] $Message"
+    
+    if (!(Test-Path (Split-Path $Script:StabilityLogPath -Parent))) { 
+        New-Item -ItemType Directory -Path (Split-Path $Script:StabilityLogPath -Parent) -Force | Out-Null 
+    }
+    
+    Add-Content -Path $Script:StabilityLogPath -Value $entry -ErrorAction SilentlyContinue
+    Write-Host $entry -ForegroundColor $(switch($Level) { "ERROR" {"Red"} "WARN" {"Yellow"} default {"White"} })
 }
 
 function Initialize-Mutex {
-    try {
+    $mutexName = $Config.MutexName
+    
+    Write-StabilityLog "Initializing mutex and PID checks"
+    
+    # Check if PID file exists and process is still running
+    if (Test-Path $Config.PIDFilePath) {
         try {
-            $Global:AntivirusState.Mutex = New-Object System.Threading.Mutex($false, $Config.MutexName)
-            $Acquired = $Global:AntivirusState.Mutex.WaitOne(500)
+            $existingPID = Get-Content $Config.PIDFilePath -ErrorAction Stop
+            $existingProcess = Get-Process -Id $existingPID -ErrorAction SilentlyContinue
             
-            if (!$Acquired) {
-                throw "Another instance is already running (mutex check)"
+            if ($existingProcess) {
+                Write-StabilityLog "Blocked duplicate instance - existing PID: $existingPID" "WARN"
+                Write-Host "[!] Another instance is already running (PID: $existingPID)" -ForegroundColor Yellow
+                Write-AVLog "Blocked duplicate instance - existing PID: $existingPID" "WARN"
+                throw "Another instance is already running (PID: $existingPID)"
             }
-        } catch {
-            # Fallback to PID file check if mutex fails
-            Write-AVLog "Mutex creation failed, using PID file fallback: $_" "WARN"
-            
-            if (Test-Path $Config.PIDFilePath) {
-                $ExistingPID = Get-Content $Config.PIDFilePath -ErrorAction SilentlyContinue
-                $ExistingProcess = Get-Process -Id $ExistingPID -ErrorAction SilentlyContinue
-                
-                if ($ExistingProcess -and $ExistingProcess.ProcessName -like "*powershell*") {
-                    throw "Another instance is already running (PID: $ExistingPID)"
-                }
+            else {
+                # Stale PID file, remove it
+                Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
+                Write-StabilityLog "Removed stale PID file (process $existingPID not running)"
+                Write-AVLog "Removed stale PID file (process $existingPID not running)"
             }
         }
+        catch {
+            if ($_.Exception.Message -like "*already running*") {
+                throw
+            }
+            # PID file exists but can't be read or is invalid, remove it
+            Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
+            Write-StabilityLog "Removed invalid PID file"
+        }
+    }
+    
+    try {
+        $Global:AntivirusState.Mutex = New-Object System.Threading.Mutex($false, $mutexName)
+        $acquired = $Global:AntivirusState.Mutex.WaitOne(3000)
         
+        if (!$acquired) {
+            Write-StabilityLog "Failed to acquire mutex - another instance is running" "ERROR"
+            Write-Host "[!] Failed to acquire mutex - another instance is running" -ForegroundColor Yellow
+            throw "Another instance is already running (mutex locked)"
+        }
+        
+        # Write PID file
         $PID | Out-File -FilePath $Config.PIDFilePath -Force
         $Global:AntivirusState.Running = $true
-        Write-AVLog "Antivirus protection started (PID: $PID)"
-    } catch {
-        Write-AVLog "Initialization failed: $_" "ERROR"
+        Write-StabilityLog "Mutex acquired, PID file written: $PID"
+        Write-AVLog "Antivirus started (PID: $PID)"
+        Write-Host "[+] Process ID: $PID" -ForegroundColor Green
+        
+        # Register cleanup on exit
+        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+            try {
+                Write-StabilityLog "PowerShell exiting - cleaning up mutex and PID"
+                if ($Global:AntivirusState.Mutex) {
+                    $Global:AntivirusState.Mutex.ReleaseMutex()
+                    $Global:AntivirusState.Mutex.Dispose()
+                }
+                if (Test-Path $Config.PIDFilePath) {
+                    Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                Write-StabilityLog "Cleanup error: $_" "ERROR"
+            }
+        } | Out-Null
+        
+    }
+    catch {
+        Write-StabilityLog "Mutex initialization failed: $_" "ERROR"
         throw
     }
-}
-
-function Initialize-HMACKey {
-    $KeyPath = $Config.HMACKeyPath
-    if (Test-Path $KeyPath) {
-        $Global:AntivirusState.HMACKey = [Convert]::FromBase64String((Get-Content $KeyPath -Raw))
-    } else {
-        $Key = New-Object byte[] 32
-        [System.Security.Cryptography.RNGCryptoServiceProvider]::Create().GetBytes($Key)
-        $Global:AntivirusState.HMACKey = $Key
-        [Convert]::ToBase64String($Key) | Set-Content $KeyPath
-    }
-    Write-AVLog "Database integrity system initialized"
-}
-
-function Initialize-Database {
-    $DBPath = Join-Path $Config.DatabasePath "database.json"
-    if (!(Test-Path $DBPath)) {
-        $DB = @{ Threats = @(); Scans = @(); Version = 1 }
-        $DB | ConvertTo-Json -Depth 10 | Set-Content $DBPath
-    }
-    
-    $Global:AntivirusState.Database = Get-Content $DBPath -Raw | ConvertFrom-Json
-    
-    if (Test-Path $Config.WhitelistPath) {
-        $Global:AntivirusState.Whitelist = Get-Content $Config.WhitelistPath | ConvertFrom-Json
-    } else {
-        $Global:AntivirusState.Whitelist = @()
-        @() | ConvertTo-Json | Set-Content $Config.WhitelistPath
-    }
-    
-    Write-AVLog "Database loaded"
 }
 
 function Start-ManagedJob {
     param(
         [string]$ModuleName,
-        [int]$IntervalSeconds,
-        [hashtable]$Parameters = @{}
+        [int]$IntervalSeconds = 30
     )
     
-    $JobName = "AV_$ModuleName"
+    $jobName = "AV_$ModuleName"
     
-    if (Get-Job -Name $JobName -ErrorAction SilentlyContinue) {
-        Write-AVLog "Job $JobName already running" "WARN"
+    if ($Global:AntivirusState.Jobs.ContainsKey($jobName)) { 
+        return 
+    }
+    
+    $modulePath = Join-Path $Script:ModulesPath "$ModuleName.psm1"
+    
+    if (!(Test-Path $modulePath)) { 
+        Write-AVLog "Module not found: $modulePath" "WARN"
+        return 
+    }
+    
+    try {
+        $testImport = Import-Module $modulePath -PassThru -ErrorAction Stop
+        Remove-Module $testImport.Name -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-AVLog "Module validation failed: $ModuleName - $_" "ERROR"
         return
     }
     
-    $Job = Start-Job -Name $JobName -ScriptBlock {
-        param($ModulePath, $Interval, $Params, $ConfigData, $ExclusionPaths, $ExclusionProcesses)
+    # Start the job
+    $job = Start-Job -Name $jobName -ScriptBlock {
+        param($modPath, $cfg)
         
-        Import-Module $ModulePath -Force
-        $ModuleName = [System.IO.Path]::GetFileNameWithoutExtension($ModulePath)
-        $FunctionName = "Invoke-$ModuleName"
-        
-        # Merge exclusions into config
-        $ConfigData.ExclusionPaths = $ExclusionPaths
-        $ConfigData.ExclusionProcesses = $ExclusionProcesses
-        
-        while ($true) {
-            try {
-                & $FunctionName @Params @ConfigData
-            } catch {
-                Write-Output "[$ModuleName] Error: $_"
+        try {
+            Import-Module $modPath -Force -ErrorAction Stop
+            $modName = [IO.Path]::GetFileNameWithoutExtension($modPath)
+            $func = "Invoke-$modName"
+            
+            if (Get-Command $func -ErrorAction SilentlyContinue) {
+                & $func @cfg
             }
-            Start-Sleep -Seconds $Interval
+            else {
+                Write-Output "[$modName ERROR] Function $func not found in module"
+            }
         }
-    } -ArgumentList (Join-Path $Script:ModulesPath "$ModuleName.psm1"), $IntervalSeconds, $Parameters, $Config, $Config.ExclusionPaths, $Config.ExclusionProcesses
+        catch {
+            Write-Output "[$modName ERROR] $_"
+        }
+    } -ArgumentList $modulePath, $Config
     
-    $Global:AntivirusState.Jobs[$JobName] = $Job
-    Write-AVLog "Started job: $JobName (Interval: ${IntervalSeconds}s)"
+    $Global:AntivirusState.Jobs[$jobName] = @{
+        Job = $job
+        IntervalSeconds = $IntervalSeconds
+        LastRun = Get-Date
+        Module = $ModuleName
+    }
+    
+    Write-AVLog "Started job: $jobName (${IntervalSeconds}s interval)"
 }
 
 function Monitor-Jobs {
-    Write-Host "[*] Job monitoring started. Running infinite loop..." -ForegroundColor Cyan
+    Write-Host "`n[*] Monitoring started. Press Ctrl+C to stop.`n" -ForegroundColor Cyan
+    Write-StabilityLog "Entering main monitoring loop"
+    Write-AVLog "Entering main monitoring loop"
     
-    $LoopCount = 0
-    while ($true) {  # True infinite loop, not dependent on state variable
-        $LoopCount++
-        
-        # Every 12 iterations (60 seconds), show we're alive
-        if ($LoopCount % 12 -eq 0) {
-            $JobCount = $Global:AntivirusState.Jobs.Count
-            Write-Host "[v0] Monitor loop active - Jobs: $JobCount - Time: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor DarkGray
-        }
-        
-        foreach ($JobName in @($Global:AntivirusState.Jobs.Keys)) {
-            $Job = $Global:AntivirusState.Jobs[$JobName]
+    $iteration = 0
+    $lastStabilityCheck = Get-Date
+    $consecutiveErrors = 0
+    $maxConsecutiveErrors = 10
+    
+    try {
+        while ($true) {
+            $iteration++
+            $now = Get-Date
             
-            if ($Job.State -eq "Failed") {
-                Write-AVLog "Job $JobName failed, restarting..." "WARN"
-                Write-Host "[!] Job $JobName failed, restarting..." -ForegroundColor Yellow
-                Remove-Job -Name $JobName -Force
-                $Global:AntivirusState.Jobs.Remove($JobName)
-            }
-            
-            $Output = Receive-Job -Job $Job -ErrorAction SilentlyContinue
-            if ($Output) {
-                foreach ($Line in $Output) {
-                    Write-Host "[Job Output] $Line" -ForegroundColor Gray
-                    Write-AVLog $Line
+            # Stability check every 5 minutes
+            if (($now - $lastStabilityCheck).TotalMinutes -ge 5) {
+                try {
+                    $activeJobs = Get-Job -Name "AV_*" -ErrorAction SilentlyContinue | Where-Object { $_.State -eq "Running" }
+                    Write-StabilityLog "Stability check: $($activeJobs.Count) active jobs, iteration $iteration"
+                    $lastStabilityCheck = $now
+                    $consecutiveErrors = 0  # Reset error counter on successful check
+                }
+                catch {
+                    $consecutiveErrors++
+                    Write-StabilityLog "Stability check failed: $_" "WARN"
                 }
             }
+            
+            # Too many consecutive errors - trigger recovery
+            if ($consecutiveErrors -ge $maxConsecutiveErrors) {
+                Write-StabilityLog "Too many consecutive errors ($consecutiveErrors), triggering recovery" "ERROR"
+                Start-RecoverySequence
+                $consecutiveErrors = 0
+            }
+            
+            # Heartbeat every minute
+            if ($iteration % 12 -eq 0) {
+                try {
+                    Write-Host "[v0] Monitoring active - $($Global:AntivirusState.Jobs.Count) jobs running" -ForegroundColor DarkGray
+                    Write-StabilityLog "Heartbeat: $($Global:AntivirusState.Jobs.Count) jobs, iteration $iteration"
+                    Write-AVLog "Heartbeat: $($Global:AntivirusState.Jobs.Count) jobs active"
+                }
+                catch {
+                    $consecutiveErrors++
+                    Write-StabilityLog "Heartbeat failed: $_" "WARN"
+                }
+            }
+            
+            $jobNames = @($Global:AntivirusState.Jobs.Keys)
+            
+            foreach ($jobName in $jobNames) {
+                try {
+                    if (-not $Global:AntivirusState.Jobs.ContainsKey($jobName)) {
+                        continue
+                    }
+                    
+                    $jobInfo = $Global:AntivirusState.Jobs[$jobName]
+                    if (-not $jobInfo) {
+                        continue
+                    }
+                    
+                    $job = $null
+                    try {
+                        $job = Get-Job -Name $jobName -ErrorAction SilentlyContinue
+                    }
+                    catch {
+                        Write-StabilityLog "Get-Job failed for $jobName : $_" "WARN"
+                        continue
+                    }
+                    
+                    if (-not $job) {
+                        # Job doesn't exist, recreate it
+                        try {
+                            $elapsed = ($now - $jobInfo.LastRun).TotalSeconds
+                            if ($elapsed -ge $jobInfo.IntervalSeconds) {
+                                Write-StabilityLog "Recreating missing job: $jobName"
+                                $Global:AntivirusState.Jobs.Remove($jobName)
+                                Start-ManagedJob -ModuleName $jobInfo.Module -IntervalSeconds $jobInfo.IntervalSeconds
+                            }
+                        }
+                        catch {
+                            Write-StabilityLog "Failed to recreate job $jobName : $_" "ERROR"
+                            $consecutiveErrors++
+                        }
+                    }
+                    elseif ($job.State -eq 'Completed') {
+                        # Collect output safely
+                        try {
+                            $output = Receive-Job -Job $job -ErrorAction SilentlyContinue
+                            if ($output) {
+                                foreach ($line in $output) {
+                                    try {
+                                        if ($line) {
+                                            $lineStr = $line.ToString()
+                                            Write-AVLog "[$jobName] $lineStr"
+                                        }
+                                    }
+                                    catch {
+                                        Write-StabilityLog "Failed to process output line from $jobName" "WARN"
+                                    }
+                                }
+                            }
+                        }
+                        catch {
+                            Write-StabilityLog "Failed to receive output from $jobName : $_" "ERROR"
+                            $consecutiveErrors++
+                        }
+                        
+                        # Clean up and restart job
+                        try {
+                            Remove-Job -Name $jobName -Force -ErrorAction SilentlyContinue
+                        }
+                        catch {
+                            Write-StabilityLog "Failed to remove completed job $jobName" "WARN"
+                        }
+                        
+                        try {
+                            $elapsed = ($now - $jobInfo.LastRun).TotalSeconds
+                            if ($elapsed -ge $jobInfo.IntervalSeconds) {
+                                $Global:AntivirusState.Jobs.Remove($jobName)
+                                Start-ManagedJob -ModuleName $jobInfo.Module -IntervalSeconds $jobInfo.IntervalSeconds
+                            }
+                        }
+                        catch {
+                            Write-StabilityLog "Failed to restart completed job $jobName : $_" "ERROR"
+                            $consecutiveErrors++
+                        }
+                    }
+                    elseif ($job.State -in 'Failed','Stopped') {
+                        Write-StabilityLog "Job $jobName failed (State: $($job.State))" "WARN"
+                        Write-AVLog "Job $jobName failed (State: $($job.State))" "WARN"
+                        
+                        # Try to get error output
+                        try {
+                            $output = Receive-Job -Job $job -ErrorAction SilentlyContinue
+                            if ($output) {
+                                Write-StabilityLog "[$jobName ERROR] $output" "ERROR"
+                                Write-AVLog "[$jobName ERROR] $output" "ERROR"
+                            }
+                        }
+                        catch {
+                            Write-StabilityLog "Can't get error output from $jobName" "WARN"
+                        }
+                        
+                        try {
+                            Remove-Job -Name $jobName -Force -ErrorAction SilentlyContinue
+                        }
+                        catch {
+                            Write-StabilityLog "Failed to remove failed job $jobName" "WARN"
+                        }
+                        
+                        # Restart after interval
+                        try {
+                            $elapsed = ($now - $jobInfo.LastRun).TotalSeconds
+                            if ($elapsed -ge $jobInfo.IntervalSeconds) {
+                                $Global:AntivirusState.Jobs.Remove($jobName)
+                                Start-ManagedJob -ModuleName $jobInfo.Module -IntervalSeconds $jobInfo.IntervalSeconds
+                            }
+                        }
+                        catch {
+                            Write-StabilityLog "Failed to restart failed job $jobName : $_" "ERROR"
+                            $consecutiveErrors++
+                        }
+                    }
+                    elseif ($job.State -eq 'Running') {
+                        # Check if job is stuck (running too long)
+                        try {
+                            $elapsed = ($now - $jobInfo.LastRun).TotalSeconds
+                            if ($elapsed -gt ($jobInfo.IntervalSeconds * 3)) {
+                                Write-StabilityLog "Job $jobName appears stuck, restarting" "WARN"
+                                Write-AVLog "Job $jobName appears stuck, restarting" "WARN"
+                                Stop-Job -Name $jobName -ErrorAction SilentlyContinue
+                                Remove-Job -Name $jobName -Force -ErrorAction SilentlyContinue
+                                $Global:AntivirusState.Jobs.Remove($jobName)
+                                Start-ManagedJob -ModuleName $jobInfo.Module -IntervalSeconds $jobInfo.IntervalSeconds
+                            }
+                        }
+                        catch {
+                            Write-StabilityLog "Failed to handle stuck job $jobName" "WARN"
+                        }
+                    }
+                }
+                catch {
+                    $consecutiveErrors++
+                    Write-StabilityLog "Job processing error for $jobName : $_" "ERROR"
+                    try {
+                        Write-AVLog "Job processing error for $jobName : $_" "ERROR"
+                    }
+                    catch {
+                        # Even logging failed, just continue
+                    }
+                }
+            }
+            
+            # Reset error counter on successful iteration
+            if ($consecutiveErrors -gt 0) {
+                $consecutiveErrors = [Math]::Max(0, $consecutiveErrors - 1)
+            }
+            
+            Start-Sleep -Seconds 5
+        }
+    }
+    catch {
+        # Outer loop error - log and continue
+        try {
+            Write-StabilityLog "Monitor-Jobs outer loop error: $_" "ERROR"
+            Write-AVLog "Monitor-Jobs iteration error: $_" "ERROR"
+            Write-Host "[!] Monitor iteration error (recovering): $_" -ForegroundColor Yellow
+        }
+        catch {
+            # Can't even log, just sleep and continue
         }
         
+        # Don't exit - enter recovery mode
+        Start-RecoverySequence
         Start-Sleep -Seconds 5
+        
+        # Restart monitoring
+        Monitor-Jobs
     }
 }
 
-# ============================================================================
-# UNSIGNED DLL SCANNER (UNTOUCHED - RUNS SEPARATELY)
-# ============================================================================
-
-function Start-UnsignedDLLScanner {
-    if (-not $Config.EnableUnsignedDLLScanner) {
-        return
+function Start-RecoverySequence {
+    Write-StabilityLog "Starting recovery sequence" "WARN"
+    
+    try {
+        # Clean up all jobs
+        Get-Job -Name "AV_*" -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                Stop-Job $_ -ErrorAction SilentlyContinue
+                Remove-Job $_ -Force -ErrorAction SilentlyContinue
+            }
+            catch {
+                Write-StabilityLog "Failed to clean up job $($_.Name)" "WARN"
+            }
+        }
+        
+        # Clear job state
+        $Global:AntivirusState.Jobs.Clear()
+        
+        # Wait a bit before restarting
+        Start-Sleep -Seconds 10
+        
+        Write-StabilityLog "Recovery sequence completed"
     }
-    
-    $UnsignedDLLPath = Join-Path $Script:ModulesPath "UnsignedDLL-Scanner.ps1"
-    
-    if (-not (Test-Path $UnsignedDLLPath)) {
-        Write-AVLog "Unsigned DLL Scanner not found at $UnsignedDLLPath" "WARN"
-        return
+    catch {
+        Write-StabilityLog "Recovery sequence failed: $_" "ERROR"
     }
-    
-    $Job = Start-Job -Name "AV_UnsignedDLLScanner_Standalone" -FilePath $UnsignedDLLPath
-    Write-AVLog "Started Unsigned DLL Scanner as standalone process"
-    Write-Host "[+] Started Unsigned DLL Scanner (Standalone)" -ForegroundColor Green
 }
 
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
 
-if ($Uninstall) {
-    Uninstall-Antivirus
-}
-
 try {
-    Write-Host "`n======================================" -ForegroundColor Cyan
-    Write-Host "  Modular Antivirus Protection v4.0" -ForegroundColor Cyan
-    Write-Host "======================================`n" -ForegroundColor Cyan
+    if ($Uninstall) { 
+        Uninstall-Antivirus 
+    }
+    
+    Write-Host "`nModular Antivirus Protection v5.1 (Stability Update)`n" -ForegroundColor Cyan
+    Write-StabilityLog "=== Antivirus Starting ==="
     
     Install-Antivirus
+
+    # Initialize mutex
     Initialize-Mutex
-    Initialize-HMACKey
-    Initialize-Database
     
-    Write-Host "`n[*] Discovering and loading detection modules..." -ForegroundColor Cyan
+    # Create event log source
+    if (-not [System.Diagnostics.EventLog]::SourceExists($Config.EDRName)) {
+        New-EventLog -LogName Application -Source $Config.EDRName -ErrorAction SilentlyContinue
+    }
     
-    $DiscoveredModules = Get-ChildItem -Path $Script:ModulesPath -Filter "*.psm1" -ErrorAction SilentlyContinue
+    Write-Host "[*] Loading detection modules...`n" -ForegroundColor Cyan
+    Write-StabilityLog "Starting module loading phase"
+
+    $loaded = 0
+    $failed = 0
     
-    $LoadedCount = 0
-    foreach ($ModuleFile in $DiscoveredModules) {
-        $ModuleName = [System.IO.Path]::GetFileNameWithoutExtension($ModuleFile.Name)
-        
-        # Get interval from config or use default
-        $IntervalKey = "${ModuleName}IntervalSeconds"
-        $IntervalSeconds = if ($Script:ManagedJobConfig.$IntervalKey) {
-            $Script:ManagedJobConfig.$IntervalKey
-        } else {
-            30  # Default interval for unknown modules
+    # Load all .psm1 modules from Modules directory
+    Get-ChildItem -Path $Script:ModulesPath -Filter "*.psm1" -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $modName = [IO.Path]::GetFileNameWithoutExtension($_.Name)
+        $key = "${modName}IntervalSeconds"
+        $interval = if ($Script:ManagedJobConfig.ContainsKey($key)) { 
+            $Script:ManagedJobConfig[$key] 
+        } else { 
+            60 
         }
         
         try {
-            Start-ManagedJob -ModuleName $ModuleName -IntervalSeconds $IntervalSeconds
-            Write-Host "[+] Loaded: $ModuleName (Interval: ${IntervalSeconds}s)" -ForegroundColor Green
-            $LoadedCount++
-        } catch {
-            Write-Host "[!] Failed to load $ModuleName : $_" -ForegroundColor Red
-            Write-AVLog "Failed to load module $ModuleName : $_" "ERROR"
+            Start-ManagedJob -ModuleName $modName -IntervalSeconds $interval
+            
+            if ($Global:AntivirusState.Jobs.ContainsKey("AV_$modName")) {
+                Write-Host "[+] $modName ($interval sec)" -ForegroundColor Green
+                Write-StabilityLog "Successfully loaded module: $modName"
+                $loaded++
+            }
+            else {
+                Write-Host "[!] $modName - skipped (validation failed)" -ForegroundColor Yellow
+                Write-StabilityLog "Module validation failed: $modName" "WARN"
+                $failed++
+            }
+        }
+        catch {
+            Write-Host "[!] Failed to start $modName : $_" -ForegroundColor Red
+            Write-StabilityLog "Module load failed: $modName - $_" "ERROR"
+            Write-AVLog "Module load failed: $modName - $_" "ERROR"
+            $failed++
         }
     }
     
-    Write-Host "`n[+] Successfully loaded $LoadedCount/$($DiscoveredModules.Count) detection modules!" -ForegroundColor Green
+    Write-Host "`n[+] Loaded $loaded modules" -ForegroundColor Green
+    if ($failed -gt 0) {
+        Write-Host "[!] $failed modules failed to load" -ForegroundColor Yellow
+    }
     
-    Write-Host "`n[*] Starting Unsigned DLL Scanner..." -ForegroundColor Cyan
-    Start-UnsignedDLLScanner
-    
+    Write-StabilityLog "Module loading complete: $loaded loaded, $failed failed"
+
     Write-Host "`n========================================" -ForegroundColor Green
-    Write-Host "  Antivirus Protection is now ACTIVE" -ForegroundColor Green
-    Write-Host "  Active Jobs: $($Global:AntivirusState.Jobs.Count)" -ForegroundColor Green
+    Write-Host "  Antivirus Protection ACTIVE" -ForegroundColor Green
+    Write-Host "  Active jobs: $($Global:AntivirusState.Jobs.Count)" -ForegroundColor Green
     Write-Host "========================================" -ForegroundColor Green
-    Write-Host "`n[*] Press Ctrl+C to stop all modules and exit`n" -ForegroundColor Yellow
+    Write-Host "`nPress Ctrl+C to stop`n" -ForegroundColor Yellow
+    
+    Write-StabilityLog "Antivirus fully started with $($Global:AntivirusState.Jobs.Count) active jobs"
+    Write-AVLog "About to enter Monitor-Jobs loop"
+    Write-Host "[v0] Entering Monitor-Jobs - script should never exit from here" -ForegroundColor Magenta
     
     Monitor-Jobs
-
-} catch {
-    $ErrorMsg = $_.Exception.Message
-    Write-Host "[!] Error during initialization: $ErrorMsg" -ForegroundColor Red
-    Write-AVLog "Initialization error: $ErrorMsg" "ERROR"
     
-    # Only exit if it's a critical error (another instance running)
-    if ($ErrorMsg -like "*already running*") {
-        Write-Host "[!] Exiting - another instance is running" -ForegroundColor Red
+    # This line should NEVER be reached since Monitor-Jobs has while($true)
+    Write-Host "[!] WARNING: Monitor-Jobs exited unexpectedly!" -ForegroundColor Red
+    Write-StabilityLog "Monitor-Jobs exited unexpectedly - entering emergency loop" "ERROR"
+    Write-AVLog "Monitor-Jobs exited - entering emergency loop" "ERROR"
+    
+    # Emergency infinite loop - script must NEVER exit
+    Write-Host "[v0] Emergency loop active - script will not exit" -ForegroundColor Yellow
+    while ($true) {
+        Start-Sleep -Seconds 30
+        Write-StabilityLog "Emergency loop heartbeat" "WARN"
+        Write-Host "[v0] Emergency loop heartbeat - $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor DarkGray
+    }
+}
+catch {
+    $err = $_.Exception.Message
+    Write-Host "`n[!] Critical error: $err`n" -ForegroundColor Red
+    Write-StabilityLog "Critical startup error: $err" "ERROR"
+    Write-AVLog "Startup error: $err" "ERROR"
+    
+    if ($err -like "*already running*") {
+        Write-Host "[i] Another instance is running. Exiting.`n" -ForegroundColor Yellow
+        Write-StabilityLog "Blocked duplicate instance - exiting" "INFO"
         exit 1
     }
     
-    Write-Host "[*] Attempting to continue despite error..." -ForegroundColor Yellow
-    if ($Global:AntivirusState.Jobs.Count -gt 0) {
-        Write-Host "[*] Monitoring active jobs..." -ForegroundColor Yellow
-        Monitor-Jobs
+    $targetScript = Join-Path $Script:InstallPath $Script:ScriptName
+    if ($PSCommandPath -eq $targetScript) {
+        Write-Host "[!] Error occurred but keeping script alive (install location)" -ForegroundColor Yellow
+        Write-StabilityLog "Entering error recovery loop - script will not exit" "WARN"
+        while ($true) {
+            Start-Sleep -Seconds 30
+            Write-StabilityLog "Error recovery loop heartbeat" "WARN"
+            Write-Host "[v0] Error recovery loop - $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor DarkGray
+        }
     }
-} finally {
-    Write-Host "`n[*] Shutting down antivirus protection..." -ForegroundColor Yellow
-    
-    if ($Global:AntivirusState.Mutex) {
-        $Global:AntivirusState.Mutex.ReleaseMutex()
-        $Global:AntivirusState.Mutex.Dispose()
+    else {
+        # Only exit if we're NOT at install location
+        Write-StabilityLog "Exiting - not running from install location" "INFO"
+        exit 1
     }
-    
-    Write-Host "[*] Stopping all jobs..."
-    foreach ($JobName in $Global:AntivirusState.Jobs.Keys) {
-        Stop-Job -Name $JobName -ErrorAction SilentlyContinue
-        Remove-Job -Name $JobName -Force -ErrorAction SilentlyContinue
-    }
-    
-    if (Test-Path $Config.PIDFilePath) {
-        Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
-    }
-    
-    Write-Host "[+] Antivirus protection stopped`n" -ForegroundColor Green
+}
+
+# This should NEVER be reached
+Write-Host "[!] CRITICAL: Script reached end of file!" -ForegroundColor Red
+Write-StabilityLog "Script reached EOF - entering final safety loop" "ERROR"
+while ($true) { 
+    Start-Sleep -Seconds 60 
+    Write-StabilityLog "EOF safety loop heartbeat" "ERROR"
+    Write-Host "[v0] EOF safety loop" -ForegroundColor Magenta
 }

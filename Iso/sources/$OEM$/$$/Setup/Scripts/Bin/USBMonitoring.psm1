@@ -7,13 +7,12 @@ function Invoke-USBMonitoring {
         }
         
         if ($Device.FriendlyName -match "Mass Storage") {
-            $AutoRunPath = Get-Volume | Where-Object { $_.DriveType -eq "Removable" } | ForEach-Object {
-                "$($_.DriveLetter):\autorun.inf"
-            }
+            $RemovableDrives = Get-WmiObject -Class Win32_LogicalDisk -Filter "DriveType=2" -ErrorAction SilentlyContinue
             
-            foreach ($Path in $AutoRunPath) {
-                if (Test-Path $Path) {
-                    Write-Output "[USB] THREAT: Autorun.inf detected on removable drive | Path: $Path"
+            foreach ($Drive in $RemovableDrives) {
+                $AutoRunPath = "$($Drive.DeviceID)\autorun.inf"
+                if (Test-Path $AutoRunPath) {
+                    Write-Output "[USB] THREAT: Autorun.inf detected on removable drive | Path: $AutoRunPath"
                 }
             }
         }

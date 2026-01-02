@@ -11,7 +11,7 @@ A comprehensive, production-grade antivirus and Endpoint Detection and Response 
 
 ### System Components
 
-1. **Antivirus-Core.ps1** - Main launcher and job orchestration engine
+1. **Antivirus.ps1** - Main launcher and job orchestration engine
 2. **28 Detection Modules (.psm1)** - Independent, hot-swappable detection engines
 3. **UnsignedDLL-Scanner** - Integrated but separate signature verification scanner
 
@@ -69,10 +69,10 @@ git clone https://github.com/your-repo/antivirus-modular.git
 cd antivirus-modular
 
 # 2. Run as Administrator (THIS IS THE ONLY FILE YOU NEED TO RUN)
-powershell.exe -ExecutionPolicy Bypass -File .\Antivirus-Core.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\Antivirus.ps1
 ```
 
-**Important: Only run `Antivirus-Core.ps1` - it automatically loads all .psm1 modules and launches the DLL scanner.**
+**Important: Only run `Antivirus.ps1` - it automatically loads all .psm1 modules and launches the DLL scanner.**
 
 The core script will automatically:
 1. Create `C:\ProgramData\AntivirusProtection` directory structure
@@ -96,7 +96,7 @@ Get-Content "C:\ProgramData\AntivirusProtection\Logs\antivirus_log.txt" -Tail 20
 
 ## ⚙️ Configuration
 
-Edit `Antivirus-Core.ps1` to customize:
+Edit `Antivirus.ps1` to customize:
 
 ### Enable/Disable Modules
 
@@ -176,7 +176,7 @@ Export-ModuleMember -Function Invoke-CustomDetection
 
 ### Register in Core
 
-Edit `Antivirus-Core.ps1`:
+Edit `Antivirus.ps1`:
 
 ```powershell
 # Add to config
@@ -277,7 +277,7 @@ Get-Job | Where-Object { $_.Name -like "AV_*" -and $_.State -eq "Failed" }
 
 ```
 C:\ProgramData\AntivirusProtection\
-├── Antivirus-Core.ps1               # Main launcher
+├── Antivirus.ps1               # Main launcher
 ├── Modules\                         # Detection modules
 │   ├── HashDetection.psm1
 │   ├── LOLBinDetection.psm1
@@ -341,7 +341,7 @@ Get-Job | Where-Object { $_.Name -like "AV_*" } | Remove-Job -Force
 ### Uninstallation
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\Antivirus-Core.ps1 -Uninstall
+powershell.exe -ExecutionPolicy Bypass -File .\Antivirus.ps1 -Uninstall
 ```
 
 This will:
@@ -421,7 +421,7 @@ Get-Content "C:\ProgramData\AntivirusProtection\Logs\antivirus_log.txt" | Select
 
 ### DLL Scanner Too Aggressive
 
-Edit scanner exclusions in `Antivirus-Core.ps1`:
+Edit scanner exclusions in `Antivirus.ps1`:
 
 ```powershell
 # Find the $Script:UnsignedDLLScannerCode block
