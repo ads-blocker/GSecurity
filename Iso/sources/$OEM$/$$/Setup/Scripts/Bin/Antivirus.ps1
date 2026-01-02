@@ -1954,7 +1954,7 @@ function Set-HostsFileBlock {
         $adEntries = @(
             "",
             "# Ad Blocking - Redirect ad domains to localhost",
-            "$RedirectIP`t$pagead2.googlesyndication.com",
+            "$RedirectIP`tpagead2.googlesyndication.com",
             "$RedirectIP`tgooglesyndication.com",
             "$RedirectIP`tgoogleadservices.com",
             "$RedirectIP`tads.google.com",
@@ -2232,6 +2232,7 @@ public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntP
 
     return $results
 }
+
 
 
 # ===================== Main =====================
