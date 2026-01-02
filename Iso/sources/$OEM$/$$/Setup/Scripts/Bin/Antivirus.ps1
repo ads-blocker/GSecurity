@@ -1,0 +1,2163 @@
+﻿param([switch]$Uninstall)
+
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
+
+# ============================================================================
+# Modular Antivirus & EDR - Single File Build
+# Author: Gorstak
+# ============================================================================
+
+$Script:InstallPath = "C:\ProgramData\AntivirusProtection"
+$Script:ScriptName = Split-Path -Leaf $PSCommandPath
+$Script:MaxRestartAttempts = 3
+$Script:StabilityLogPath = "$Script:InstallPath\Logs\stability_log.txt"
+
+$Script:ManagedJobConfig = @{
+    HashDetectionIntervalSeconds = 15
+    LOLBinDetectionIntervalSeconds = 15
+    ProcessAnomalyDetectionIntervalSeconds = 15
+    AMSIBypassDetectionIntervalSeconds = 15
+    CredentialDumpDetectionIntervalSeconds = 15
+    WMIPersistenceDetectionIntervalSeconds = 120
+    ScheduledTaskDetectionIntervalSeconds = 120
+    RegistryPersistenceDetectionIntervalSeconds = 120
+    DLLHijackingDetectionIntervalSeconds = 90
+    TokenManipulationDetectionIntervalSeconds = 60
+    ProcessHollowingDetectionIntervalSeconds = 30
+    KeyloggerDetectionIntervalSeconds = 45
+    KeyScramblerManagementIntervalSeconds = 60
+    RansomwareDetectionIntervalSeconds = 15
+    NetworkAnomalyDetectionIntervalSeconds = 30
+    NetworkTrafficMonitoringIntervalSeconds = 45
+    RootkitDetectionIntervalSeconds = 180
+    ClipboardMonitoringIntervalSeconds = 30
+    COMMonitoringIntervalSeconds = 120
+    BrowserExtensionMonitoringIntervalSeconds = 300
+    ShadowCopyMonitoringIntervalSeconds = 30
+    USBMonitoringIntervalSeconds = 20
+    EventLogMonitoringIntervalSeconds = 60
+    FirewallRuleMonitoringIntervalSeconds = 120
+    ServiceMonitoringIntervalSeconds = 60
+    FilelessDetectionIntervalSeconds = 20
+    MemoryScanningIntervalSeconds = 90
+    NamedPipeMonitoringIntervalSeconds = 45
+    DNSExfiltrationDetectionIntervalSeconds = 30
+    PasswordManagementIntervalSeconds = 120
+    YouTubeAdBlockerIntervalSeconds = 300
+}
+
+$Config = @{
+    EDRName = "MalwareDetector"
+    LogPath = "$Script:InstallPath\Logs"
+    QuarantinePath = "$Script:InstallPath\Quarantine"
+    DatabasePath = "$Script:InstallPath\Data"
+    WhitelistPath = "$Script:InstallPath\Data\whitelist.json"
+    ReportsPath = "$Script:InstallPath\Reports"
+    HMACKeyPath = "$Script:InstallPath\Data\db_integrity.hmac"
+    PIDFilePath = "$Script:InstallPath\Data\antivirus.pid"
+    MutexName = "Local\AntivirusProtection_Mutex_{0}_{1}" -f $env:COMPUTERNAME, $env:USERNAME
+
+    CirclHashLookupUrl = "https://hashlookup.circl.lu/lookup/sha256"
+    CymruApiUrl = "https://api.malwarehash.cymru.com/v1/hash"
+    MalwareBazaarApiUrl = "https://mb-api.abuse.ch/api/v1/"
+
+    ExclusionPaths = @(
+        $Script:InstallPath,
+        "$Script:InstallPath\Logs",
+        "$Script:InstallPath\Quarantine",
+        "$Script:InstallPath\Reports",
+        "$Script:InstallPath\Data"
+    )
+    ExclusionProcesses = @("powershell", "pwsh")
+
+    EnableUnsignedDLLScanner = $true
+    AutoKillThreats = $true
+    AutoQuarantine = $true
+    MaxMemoryUsageMB = 500
+}
+
+$Global:AntivirusState = @{
+    Running = $false
+    Installed = $false
+    Jobs = @{}
+    Mutex = $null
+    ThreatCount = 0
+}
+
+$Script:LoopCounter = 0
+$script:ManagedJobs = @{}
+
+function Write-AVLog {
+    param([string]$Message, [string]$Level = "INFO")
+
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "[$ts] [$Level] $Message"
+    $logFile = Join-Path $Config.LogPath "antivirus_log.txt"
+
+    if (!(Test-Path $Config.LogPath)) {
+        New-Item -ItemType Directory -Path $Config.LogPath -Force | Out-Null
+    }
+
+    Add-Content -Path $logFile -Value $entry -ErrorAction SilentlyContinue
+
+    $eid = switch ($Level) {
+        "ERROR" { 1001 }
+        "WARN" { 1002 }
+        "THREAT" { 1003 }
+        default { 1000 }
+    }
+
+    Write-EventLog -LogName Application -Source $Config.EDRName -EntryType Information -EventId $eid -Message $Message -ErrorAction SilentlyContinue
+}
+
+function Write-StabilityLog {
+    param([string]$Message, [string]$Level = "INFO")
+
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "[$ts] [$Level] [STABILITY] $Message"
+
+    if (!(Test-Path (Split-Path $Script:StabilityLogPath -Parent))) {
+        New-Item -ItemType Directory -Path (Split-Path $Script:StabilityLogPath -Parent) -Force | Out-Null
+    }
+
+    Add-Content -Path $Script:StabilityLogPath -Value $entry -ErrorAction SilentlyContinue
+    Write-Host $entry -ForegroundColor $(switch($Level) { "ERROR" {"Red"} "WARN" {"Yellow"} default {"White"} })
+}
+
+function Reset-InternetProxySettings {
+    try {
+        Get-Job -Name "YouTubeAdBlockerProxy" -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue
+    }
+    catch {}
+
+    try {
+        $pacFile = "$env:TEMP\youtube-adblocker.pac"
+        if (Test-Path $pacFile) {
+            Remove-Item -Path $pacFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {}
+
+    try {
+        $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        if (Test-Path $regPath) {
+            Remove-ItemProperty -Path $regPath -Name AutoConfigURL -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $regPath -Name ProxyEnable -Value 0 -ErrorAction SilentlyContinue
+        }
+    }
+    catch {}
+}
+
+function Register-ExitCleanup {
+    if ($script:ExitCleanupRegistered) {
+        return
+    }
+
+    try {
+        Register-EngineEvent -SourceIdentifier "AntivirusProtection_ExitCleanup" -EventName PowerShell.Exiting -Action {
+            try { Reset-InternetProxySettings } catch {}
+        } | Out-Null
+        $script:ExitCleanupRegistered = $true
+    }
+    catch {
+    }
+}
+
+function Install-Antivirus {
+    $targetScript = Join-Path $Script:InstallPath $Script:ScriptName
+    $currentPath = $PSCommandPath
+
+    if ($currentPath -eq $targetScript) {
+        Write-Host "[+] Running from install location" -ForegroundColor Green
+        $Global:AntivirusState.Installed = $true
+        Install-Persistence
+        return $true
+    }
+
+    Write-Host "`n=== Installing Antivirus ===`n" -ForegroundColor Cyan
+
+    @("Data","Logs","Quarantine","Reports") | ForEach-Object {
+        $p = Join-Path $Script:InstallPath $_
+        if (!(Test-Path $p)) {
+            New-Item -ItemType Directory -Path $p -Force | Out-Null
+            Write-Host "[+] Created: $p"
+        }
+    }
+
+    Copy-Item -Path $PSCommandPath -Destination $targetScript -Force
+    Write-Host "[+] Copied main script to $targetScript"
+
+    Install-Persistence
+
+    Write-Host "`n[+] Installation complete. Continuing in this instance...`n" -ForegroundColor Green
+    $Global:AntivirusState.Installed = $true
+    return $true
+}
+
+function Install-Persistence {
+    Write-Host "`n[*] Setting up persistence for automatic startup...`n" -ForegroundColor Cyan
+
+    try {
+        Get-ScheduledTask -TaskName "AntivirusProtection" -ErrorAction SilentlyContinue |
+            Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+
+        $taskAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$($Script:InstallPath)\$($Script:ScriptName)`""
+        $taskTrigger = New-ScheduledTaskTrigger -AtLogon -User $env:USERNAME
+        $taskTriggerBoot = New-ScheduledTaskTrigger -AtStartup
+        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+        $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RunOnlyIfNetworkAvailable -DontStopOnIdleEnd
+
+        Register-ScheduledTask -TaskName "AntivirusProtection" -Action $taskAction -Trigger $taskTrigger,$taskTriggerBoot -Principal $taskPrincipal -Settings $taskSettings -Force -ErrorAction Stop
+
+        Write-Host "[+] Scheduled task created for automatic startup" -ForegroundColor Green
+        Write-StabilityLog "Persistence setup completed - scheduled task created"
+    }
+    catch {
+        Write-Host "[!] Failed to create scheduled task: $_" -ForegroundColor Red
+        Write-StabilityLog "Persistence setup failed: $_" "ERROR"
+
+        try {
+            $startupFolder = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
+            $shortcutPath = Join-Path $startupFolder "AntivirusProtection.lnk"
+
+            $shell = New-Object -ComObject WScript.Shell
+            $shortcut = $shell.CreateShortcut($shortcutPath)
+            $shortcut.TargetPath = "powershell.exe"
+            $shortcut.Arguments = "-ExecutionPolicy Bypass -File `"$($Script:InstallPath)\$($Script:ScriptName)`""
+            $shortcut.WorkingDirectory = $Script:InstallPath
+            $shortcut.Save()
+
+            Write-Host "[+] Fallback: Created startup shortcut" -ForegroundColor Yellow
+            Write-StabilityLog "Fallback persistence: startup shortcut created"
+        }
+        catch {
+            Write-Host "[!] Both scheduled task and shortcut failed: $_" -ForegroundColor Red
+            Write-StabilityLog "All persistence methods failed: $_" "ERROR"
+        }
+    }
+}
+
+function Uninstall-Antivirus {
+    Write-Host "`n=== Uninstalling Antivirus ===`n" -ForegroundColor Cyan
+    Write-StabilityLog "Starting uninstall process"
+
+    try {
+        Reset-InternetProxySettings
+    }
+    catch {}
+
+    try {
+        if ($script:ManagedJobs) {
+            foreach ($k in @($script:ManagedJobs.Keys)) {
+                try { $script:ManagedJobs.Remove($k) } catch {}
+            }
+        }
+        if ($Global:AntivirusState -and $Global:AntivirusState.Jobs) {
+            $Global:AntivirusState.Jobs.Clear()
+        }
+    }
+    catch {
+        Write-StabilityLog "Failed to clear managed jobs during uninstall: $_" "WARN"
+    }
+
+    try {
+        Get-ScheduledTask -TaskName "AntivirusProtection" -ErrorAction SilentlyContinue |
+            Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host "[+] Removed scheduled task" -ForegroundColor Green
+        Write-StabilityLog "Removed scheduled task during uninstall"
+    }
+    catch {
+        Write-Host "[!] Failed to remove scheduled task: $_" -ForegroundColor Yellow
+        Write-StabilityLog "Failed to remove scheduled task: $_" "WARN"
+    }
+
+    try {
+        $shortcutPath = Join-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" "AntivirusProtection.lnk"
+        if (Test-Path $shortcutPath) {
+            Remove-Item $shortcutPath -Force -ErrorAction SilentlyContinue
+            Write-Host "[+] Removed startup shortcut" -ForegroundColor Green
+            Write-StabilityLog "Removed startup shortcut during uninstall"
+        }
+    }
+    catch {
+        Write-Host "[!] Failed to remove startup shortcut: $_" -ForegroundColor Yellow
+        Write-StabilityLog "Failed to remove startup shortcut: $_" "WARN"
+    }
+
+    if (Test-Path $Script:InstallPath) {
+        Remove-Item -Path $Script:InstallPath -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "[+] Removed installation directory" -ForegroundColor Green
+        Write-StabilityLog "Removed installation directory during uninstall"
+    }
+
+    Write-Host "[+] Uninstall complete." -ForegroundColor Green
+    Write-StabilityLog "Uninstall process completed"
+    exit 0
+}
+
+function Initialize-Mutex {
+    $mutexName = $Config.MutexName
+
+    Write-StabilityLog "Initializing mutex and PID checks"
+
+    if (Test-Path $Config.PIDFilePath) {
+        try {
+            $existingPID = Get-Content $Config.PIDFilePath -ErrorAction Stop
+            $existingProcess = Get-Process -Id $existingPID -ErrorAction SilentlyContinue
+
+            if ($existingProcess) {
+                Write-StabilityLog "Blocked duplicate instance - existing PID: $existingPID" "WARN"
+                Write-Host "[!] Another instance is already running (PID: $existingPID)" -ForegroundColor Yellow
+                Write-AVLog "Blocked duplicate instance - existing PID: $existingPID" "WARN"
+                throw "Another instance is already running (PID: $existingPID)"
+            }
+            else {
+                Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
+                Write-StabilityLog "Removed stale PID file (process $existingPID not running)"
+                Write-AVLog "Removed stale PID file (process $existingPID not running)"
+            }
+        }
+        catch {
+            if ($_.Exception.Message -like "*already running*") {
+                throw
+            }
+            Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
+            Write-StabilityLog "Removed invalid PID file"
+        }
+    }
+
+    try {
+        $Global:AntivirusState.Mutex = New-Object System.Threading.Mutex($false, $mutexName)
+        $acquired = $Global:AntivirusState.Mutex.WaitOne(3000)
+
+        if (!$acquired) {
+            Write-StabilityLog "Failed to acquire mutex - another instance is running" "ERROR"
+            Write-Host "[!] Failed to acquire mutex - another instance is running" -ForegroundColor Yellow
+            throw "Another instance is already running (mutex locked)"
+        }
+
+        if (!(Test-Path (Split-Path $Config.PIDFilePath -Parent))) {
+            New-Item -ItemType Directory -Path (Split-Path $Config.PIDFilePath -Parent) -Force | Out-Null
+        }
+
+        $PID | Out-File -FilePath $Config.PIDFilePath -Force
+        $Global:AntivirusState.Running = $true
+        Write-StabilityLog "Mutex acquired, PID file written: $PID"
+        Write-AVLog "Antivirus started (PID: $PID)"
+        Write-Host "[+] Process ID: $PID" -ForegroundColor Green
+
+        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+            try {
+                Write-StabilityLog "PowerShell exiting - cleaning up mutex and PID"
+                if ($Global:AntivirusState.Mutex) {
+                    $Global:AntivirusState.Mutex.ReleaseMutex()
+                    $Global:AntivirusState.Mutex.Dispose()
+                }
+                if (Test-Path $Config.PIDFilePath) {
+                    Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                Write-StabilityLog "Cleanup error: $_" "ERROR"
+            }
+        } | Out-Null
+
+    }
+    catch {
+        Write-StabilityLog "Mutex initialization failed: $_" "ERROR"
+        throw
+    }
+}
+
+function Select-BoundConfig {
+    param(
+        [Parameter(Mandatory=$true)][string]$FunctionName,
+        [Parameter(Mandatory=$true)][hashtable]$Config
+    )
+
+    $cmd = Get-Command $FunctionName -ErrorAction Stop
+    $paramNames = @($cmd.Parameters.Keys)
+    $bound = @{}
+    foreach ($k in $Config.Keys) {
+        if ($paramNames -contains $k) {
+            $bound[$k] = $Config[$k]
+        }
+    }
+    return $bound
+}
+
+function Register-ManagedJob {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][scriptblock]$ScriptBlock,
+        [int]$IntervalSeconds = 30,
+        [bool]$Enabled = $true,
+        [bool]$Critical = $false,
+        [int]$MaxRestartAttempts = 3,
+        [int]$RestartDelaySeconds = 5,
+        [object[]]$ArgumentList = $null
+    )
+
+    if (-not $script:ManagedJobs) {
+        $script:ManagedJobs = @{}
+    }
+
+    $minIntervalSeconds = 1
+    if ($Script:ManagedJobConfig -and $Script:ManagedJobConfig.MinimumIntervalSeconds) {
+        $minIntervalSeconds = [int]$Script:ManagedJobConfig.MinimumIntervalSeconds
+    }
+
+    $IntervalSeconds = [Math]::Max([int]$IntervalSeconds, [int]$minIntervalSeconds)
+
+    $script:ManagedJobs[$Name] = [pscustomobject]@{
+        Name = $Name
+        ScriptBlock = $ScriptBlock
+        ArgumentList = $ArgumentList
+        IntervalSeconds = $IntervalSeconds
+        Enabled = $Enabled
+        Critical = $Critical
+        MaxRestartAttempts = $MaxRestartAttempts
+        RestartDelaySeconds = $RestartDelaySeconds
+        RestartAttempts = 0
+        LastStartUtc = $null
+        LastSuccessUtc = $null
+        LastError = $null
+        NextRunUtc = [DateTime]::UtcNow
+        DisabledUtc = $null
+    }
+}
+
+function Invoke-ManagedJobsTick {
+    param(
+        [Parameter(Mandatory=$true)][DateTime]$NowUtc
+    )
+
+    if (-not $script:ManagedJobs) {
+        return
+    }
+
+    foreach ($job in $script:ManagedJobs.Values) {
+        if (-not $job.Enabled) { continue }
+        if ($null -ne $job.DisabledUtc) { continue }
+        if ($job.NextRunUtc -gt $NowUtc) { continue }
+
+        $job.LastStartUtc = $NowUtc
+
+        try {
+            if ($null -ne $job.ArgumentList) {
+                Invoke-Command -ScriptBlock $job.ScriptBlock -ArgumentList $job.ArgumentList
+            }
+            else {
+                & $job.ScriptBlock
+            }
+            $job.LastSuccessUtc = [DateTime]::UtcNow
+            $job.RestartAttempts = 0
+            $job.LastError = $null
+            $job.NextRunUtc = $job.LastSuccessUtc.AddSeconds([Math]::Max(1, $job.IntervalSeconds))
+        }
+        catch {
+            $job.LastError = $_
+            $job.RestartAttempts++
+
+            try {
+                Write-AVLog "Managed job '$($job.Name)' failed (attempt $($job.RestartAttempts)/$($job.MaxRestartAttempts)) : $($_.Exception.Message)" "WARN"
+            }
+            catch {}
+
+            if ($job.RestartAttempts -ge $job.MaxRestartAttempts) {
+                $job.RestartAttempts = 0
+                $job.DisabledUtc = $null
+                $job.NextRunUtc = [DateTime]::UtcNow.AddMinutes(5)
+                try {
+                    Write-AVLog "Managed job '$($job.Name)' exceeded max restart attempts; backing off for 5 minutes" "ERROR"
+                }
+                catch {}
+                continue
+            }
+
+            $job.NextRunUtc = [DateTime]::UtcNow.AddSeconds([Math]::Max(1, $job.RestartDelaySeconds))
+        }
+    }
+}
+
+function Start-ManagedJob {
+    param(
+        [string]$ModuleName,
+        [int]$IntervalSeconds = 30
+    )
+
+    $jobName = "AV_$ModuleName"
+
+    if ($Global:AntivirusState.Jobs.ContainsKey($jobName)) {
+        return
+    }
+
+    $funcName = "Invoke-$ModuleName"
+    if (-not (Get-Command $funcName -ErrorAction SilentlyContinue)) {
+        Write-AVLog "Function not found: $funcName" "WARN"
+        return
+    }
+
+    $maxRestarts = if ($Script:ManagedJobConfig -and $Script:ManagedJobConfig.MaxRestartAttempts) { [int]$Script:ManagedJobConfig.MaxRestartAttempts } else { 3 }
+    $restartDelay = if ($Script:ManagedJobConfig -and $Script:ManagedJobConfig.RestartDelaySeconds) { [int]$Script:ManagedJobConfig.RestartDelaySeconds } else { 5 }
+
+    $sb = {
+        param(
+            [Parameter(Mandatory=$true)][string]$FunctionName,
+            [Parameter(Mandatory=$true)][hashtable]$Cfg
+        )
+
+        $cmd = Get-Command $FunctionName -ErrorAction Stop
+        $paramNames = @($cmd.Parameters.Keys)
+        $bound = @{}
+        foreach ($k in $Cfg.Keys) {
+            if ($paramNames -contains $k) {
+                $bound[$k] = $Cfg[$k]
+            }
+        }
+        & $FunctionName @bound
+    }
+
+    Register-ManagedJob -Name $jobName -ScriptBlock $sb -ArgumentList @($funcName, $Config) -IntervalSeconds $IntervalSeconds -Enabled $true -Critical $false -MaxRestartAttempts $maxRestarts -RestartDelaySeconds $restartDelay
+
+    $Global:AntivirusState.Jobs[$jobName] = @{
+        Name = $jobName
+        IntervalSeconds = $IntervalSeconds
+        Module = $ModuleName
+    }
+
+    Write-AVLog "Registered managed job: $jobName (${IntervalSeconds}s interval)"
+}
+
+function Start-RecoverySequence {
+    Write-StabilityLog "Starting recovery sequence" "WARN"
+
+    try {
+        try {
+            Reset-InternetProxySettings
+        }
+        catch {}
+
+        if ($script:ManagedJobs) {
+            foreach ($k in @($script:ManagedJobs.Keys)) {
+                try { $script:ManagedJobs.Remove($k) } catch {}
+            }
+        }
+
+        $Global:AntivirusState.Jobs.Clear()
+        Start-Sleep -Seconds 10
+        Write-StabilityLog "Recovery sequence completed"
+    }
+    catch {
+        Write-StabilityLog "Recovery sequence failed: $_" "ERROR"
+    }
+}
+
+function Monitor-Jobs {
+    Write-Host "`n[*] Monitoring started. Press Ctrl+C to stop.`n" -ForegroundColor Cyan
+    Write-StabilityLog "Entering main monitoring loop"
+    Write-AVLog "Entering main monitoring loop"
+
+    $iteration = 0
+    $lastStabilityCheck = Get-Date
+    $consecutiveErrors = 0
+    $maxConsecutiveErrors = 10
+
+    while ($true) {
+        try {
+            while ($true) {
+                $iteration++
+                $now = Get-Date
+
+                try {
+                    Invoke-ManagedJobsTick -NowUtc ([DateTime]::UtcNow)
+                }
+                catch {
+                    $consecutiveErrors++
+                    Write-StabilityLog "Managed jobs tick failed: $_" "WARN"
+                }
+
+                if (($now - $lastStabilityCheck).TotalMinutes -ge 5) {
+                    try {
+                        $enabledCount = 0
+                        if ($script:ManagedJobs) {
+                            $enabledCount = ($script:ManagedJobs.Values | Where-Object { $_.Enabled -and ($null -eq $_.DisabledUtc) }).Count
+                        }
+                        Write-StabilityLog "Stability check: $enabledCount managed jobs enabled, iteration $iteration"
+                        $lastStabilityCheck = $now
+                        $consecutiveErrors = 0
+                    }
+                    catch {
+                        $consecutiveErrors++
+                        Write-StabilityLog "Stability check failed: $_" "WARN"
+                    }
+                }
+
+                if ($consecutiveErrors -ge $maxConsecutiveErrors) {
+                    Write-StabilityLog "Too many consecutive errors ($consecutiveErrors), triggering recovery" "ERROR"
+                    Start-RecoverySequence
+                    $consecutiveErrors = 0
+                }
+
+                if ($iteration % 12 -eq 0) {
+                    try {
+                        $enabledCount = 0
+                        $disabledCount = 0
+                        $sampleErrorMessage = $null
+                        $sampleErrorJob = $null
+                        if ($script:ManagedJobs) {
+                            $enabledCount = ($script:ManagedJobs.Values | Where-Object { $_.Enabled -and ($null -eq $_.DisabledUtc) }).Count
+                            $disabledCount = ($script:ManagedJobs.Values | Where-Object { $_.Enabled -and ($null -ne $_.DisabledUtc) }).Count
+                            try {
+                                $j = ($script:ManagedJobs.Values | Where-Object { $_.LastError } | Select-Object -First 1)
+                                if ($j) {
+                                    $sampleErrorJob = $j.Name
+                                    $sampleErrorMessage = $j.LastError.Exception.Message
+                                }
+                            }
+                            catch {}
+                        }
+                        Write-Host "[AV] Monitoring active - $enabledCount enabled / $disabledCount backoff" -ForegroundColor DarkGray
+                        Write-StabilityLog "Heartbeat: $enabledCount enabled / $disabledCount backoff, iteration $iteration" "INFO"
+                        Write-AVLog "Heartbeat: $enabledCount enabled / $disabledCount backoff"
+                        if ($sampleErrorMessage) {
+                            Write-StabilityLog "Sample job error ($sampleErrorJob): $sampleErrorMessage" "WARN"
+                        }
+                    }
+                    catch {
+                        $consecutiveErrors++
+                        Write-StabilityLog "Heartbeat failed: $_" "WARN"
+                    }
+                }
+
+                Start-Sleep -Seconds 1
+            }
+        }
+        catch {
+            try {
+                Write-StabilityLog "Monitor-Jobs outer loop error: $_" "ERROR"
+                Write-AVLog "Monitor-Jobs iteration error: $_" "ERROR"
+                Write-Host "[!] Monitor iteration error (recovering): $_" -ForegroundColor Yellow
+            }
+            catch {
+            }
+
+            Start-RecoverySequence
+            Start-Sleep -Seconds 5
+            $consecutiveErrors = 0
+            $lastStabilityCheck = Get-Date
+            continue
+        }
+    }
+}
+
+# ===================== Embedded detection modules =====================
+
+function Invoke-HashDetection {
+    param(
+        [string]$LogPath,
+        [string]$QuarantinePath,
+        [string]$CirclHashLookupUrl,
+        [string]$CymruApiUrl,
+        [string]$MalwareBazaarApiUrl,
+        [bool]$AutoQuarantine = $true
+    )
+
+    $SuspiciousPaths = @(
+        "$env:TEMP\*",
+        "$env:APPDATA\*",
+        "$env:LOCALAPPDATA\Temp\*",
+        "C:\Windows\Temp\*",
+        "$env:USERPROFILE\Downloads\*"
+    )
+
+    $Files = Get-ChildItem -Path $SuspiciousPaths -Include *.exe,*.dll,*.scr,*.vbs,*.ps1,*.bat,*.cmd -Recurse -ErrorAction SilentlyContinue
+
+    foreach ($File in $Files) {
+        try {
+            $Hash = (Get-FileHash -Path $File.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+
+            $Reputation = @{
+                IsMalicious = $false
+                Confidence = 0
+                Sources = @()
+            }
+
+            try {
+                $CirclResponse = Invoke-RestMethod -Uri "$CirclHashLookupUrl/$Hash" -Method Get -TimeoutSec 5 -ErrorAction SilentlyContinue
+                if ($CirclResponse.KnownMalicious) {
+                    $Reputation.IsMalicious = $true
+                    $Reputation.Confidence += 40
+                    $Reputation.Sources += "CIRCL"
+                }
+            } catch {}
+
+            try {
+                $MBBody = @{ query = "get_info"; hash = $Hash } | ConvertTo-Json
+                $MBResponse = Invoke-RestMethod -Uri $MalwareBazaarApiUrl -Method Post -Body $MBBody -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
+                if ($MBResponse.query_status -eq "ok") {
+                    $Reputation.IsMalicious = $true
+                    $Reputation.Confidence += 50
+                    $Reputation.Sources += "MalwareBazaar"
+                }
+            } catch {}
+
+            try {
+                $CymruResponse = Invoke-RestMethod -Uri "$CymruApiUrl/$Hash" -Method Get -TimeoutSec 5 -ErrorAction SilentlyContinue
+                if ($CymruResponse.malware -eq $true) {
+                    $Reputation.IsMalicious = $true
+                    $Reputation.Confidence += 30
+                    $Reputation.Sources += "Cymru"
+                }
+            } catch {}
+
+            if ($Reputation.IsMalicious -and $Reputation.Confidence -ge 50) {
+                Write-Output "[HashDetection] THREAT: $($File.FullName) | Hash: $Hash | Sources: $($Reputation.Sources -join ', ') | Confidence: $($Reputation.Confidence)%"
+
+                if ($AutoQuarantine -and $QuarantinePath) {
+                    $QuarantineFile = Join-Path $QuarantinePath "$([DateTime]::Now.Ticks)_$($File.Name)"
+                    Move-Item -Path $File.FullName -Destination $QuarantineFile -Force -ErrorAction SilentlyContinue
+                    Write-Output "[HashDetection] Quarantined: $($File.FullName)"
+                }
+            }
+
+            $Entropy = Measure-FileEntropy -FilePath $File.FullName
+            if ($Entropy -gt 7.5 -and $File.Length -lt 1MB) {
+                Write-Output "[HashDetection] High entropy detected: $($File.FullName) | Entropy: $([Math]::Round($Entropy, 2))"
+            }
+
+        } catch {
+            Write-Output "[HashDetection] Error scanning $($File.FullName): $_"
+        }
+    }
+}
+
+function Measure-FileEntropy {
+    param([string]$FilePath)
+
+    try {
+        $Bytes = [System.IO.File]::ReadAllBytes($FilePath)[0..4096]
+        $Freq = @{}
+        foreach ($Byte in $Bytes) {
+            if ($Freq.ContainsKey($Byte)) {
+                $Freq[$Byte]++
+            } else {
+                $Freq[$Byte] = 1
+            }
+        }
+
+        $Entropy = 0
+        $Total = $Bytes.Count
+        foreach ($Count in $Freq.Values) {
+            $P = $Count / $Total
+            $Entropy -= $P * [Math]::Log($P, 2)
+        }
+
+        return $Entropy
+    } catch {
+        return 0
+    }
+}
+
+function Invoke-LOLBinDetection {
+    param(
+        [bool]$AutoKillThreats = $true
+    )
+
+    $LOLBins = @{
+        "certutil.exe" = @("-decode", "-urlcache", "-split", "http")
+        "powershell.exe" = @("-enc", "-EncodedCommand", "bypass", "hidden", "downloadstring", "iex", "invoke-expression")
+        "cmd.exe" = @("/c echo", "powershell", "certutil")
+        "mshta.exe" = @("http", "javascript:", "vbscript:")
+        "rundll32.exe" = @("javascript:", "http", ".dat,", "comsvcs")
+        "regsvr32.exe" = @("/s /u /i:http", "scrobj.dll")
+        "wscript.exe" = @(".vbs", ".js", "http")
+        "cscript.exe" = @(".vbs", ".js", "http")
+        "bitsadmin.exe" = @("/transfer", "/download", "http")
+        "msiexec.exe" = @("/quiet", "/qn", "http")
+        "wmic.exe" = @("process call create", "shadowcopy delete")
+        "regasm.exe" = @("/U", "http")
+        "regsvcs.exe" = @("/U", "http")
+        "installutil.exe" = @("/logfile=", "/U")
+    }
+
+    $Processes = Get-Process | Where-Object { $_.Path }
+
+    foreach ($Process in $Processes) {
+        $ProcessName = $Process.ProcessName + ".exe"
+
+        if ($LOLBins.ContainsKey($ProcessName)) {
+            try {
+                $CommandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)" -ErrorAction Stop).CommandLine
+
+                if ($CommandLine) {
+                    foreach ($Indicator in $LOLBins[$ProcessName]) {
+                        if ($CommandLine -match [regex]::Escape($Indicator)) {
+                            Write-Output "[LOLBinDetection] THREAT: $ProcessName | PID: $($Process.Id) | CommandLine: $CommandLine"
+
+                            if ($AutoKillThreats) {
+                                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                                Write-Output "[LOLBinDetection] Terminated process: $ProcessName (PID: $($Process.Id))"
+                            }
+                            break
+                        }
+                    }
+                }
+            } catch {}
+        }
+    }
+}
+
+function Invoke-ProcessAnomalyDetection {
+    param(
+        [bool]$AutoKillThreats = $true
+    )
+
+    $Processes = Get-Process | Where-Object { $_.Path }
+
+    foreach ($Process in $Processes) {
+        $Score = 0
+        $Reasons = @()
+
+        if ($Process.Path -notmatch "^C:\\(Windows|Program Files)" -and $Process.ProcessName -match "^(svchost|lsass|csrss|services|smss|wininit)$") {
+            $Score += 40
+            $Reasons += "System process in non-system location"
+        }
+
+        try {
+            $ParentProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)" -ErrorAction Stop |
+                Select-Object -ExpandProperty ParentProcessId
+            $Parent = Get-Process -Id $ParentProcess -ErrorAction SilentlyContinue
+
+            if ($Parent -and $Parent.ProcessName -match "^(winword|excel|outlook|powerpnt)$" -and $Process.ProcessName -match "^(powershell|cmd|wscript|cscript)$") {
+                $Score += 35
+                $Reasons += "Script launched from Office"
+            }
+        } catch {}
+
+        if ($Process.Threads.Count -gt 100) {
+            $Score += 15
+            $Reasons += "Excessive threads: $($Process.Threads.Count)"
+        }
+
+        if ($Process.WorkingSet64 -gt 1GB) {
+            $Score += 10
+            $Reasons += "High memory usage: $([Math]::Round($Process.WorkingSet64/1GB, 2)) GB"
+        }
+
+        try {
+            $Connections = Get-NetTCPConnection -OwningProcess $Process.Id -ErrorAction SilentlyContinue
+            if ($Connections.Count -gt 50) {
+                $Score += 20
+                $Reasons += "Excessive connections: $($Connections.Count)"
+            }
+        } catch {}
+
+        if ($Score -ge 50) {
+            Write-Output "[ProcessAnomaly] THREAT: $($Process.ProcessName) | PID: $($Process.Id) | Score: $Score | Reasons: $($Reasons -join ', ')"
+
+            if ($AutoKillThreats) {
+                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                Write-Output "[ProcessAnomaly] Terminated: $($Process.ProcessName) (PID: $($Process.Id))"
+            }
+        }
+    }
+}
+
+function Invoke-AMSIBypassDetection {
+    param(
+        [bool]$AutoKillThreats = $true
+    )
+
+    $AMSIBypassPatterns = @(
+        "amsiInitFailed",
+        "AmsiScanBuffer",
+        "amsi.dll",
+        "[Ref].Assembly.GetType",
+        "System.Management.Automation.AmsiUtils"
+    )
+
+    $Processes = Get-Process | Where-Object { $_.ProcessName -match "powershell|pwsh" }
+
+    foreach ($Process in $Processes) {
+        try {
+            $CommandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)" -ErrorAction Stop).CommandLine
+
+            foreach ($Pattern in $AMSIBypassPatterns) {
+                if ($CommandLine -match [regex]::Escape($Pattern)) {
+                    Write-Output "[AMSIBypass] THREAT: AMSI bypass detected | PID: $($Process.Id) | Pattern: $Pattern"
+
+                    if ($AutoKillThreats) {
+                        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                        Write-Output "[AMSIBypass] Terminated process (PID: $($Process.Id))"
+                    }
+                    break
+                }
+            }
+        } catch {}
+    }
+}
+
+function Invoke-CredentialDumpDetection {
+    param(
+        [bool]$AutoKillThreats = $true
+    )
+
+    $SensitiveProcesses = @("lsass", "csrss", "services")
+    $SuspiciousTools = @("mimikatz", "procdump", "dumpert", "nanodump", "pypykatz")
+
+    $Processes = Get-Process | Where-Object { $_.Path }
+
+    foreach ($Process in $Processes) {
+        if ($SuspiciousTools -contains $Process.ProcessName.ToLower()) {
+            Write-Output "[CredDump] THREAT: Known credential dumping tool detected | Process: $($Process.ProcessName) | PID: $($Process.Id)"
+
+            if ($AutoKillThreats) {
+                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                Write-Output "[CredDump] Terminated: $($Process.ProcessName)"
+            }
+        }
+
+        try {
+            $Handles = Get-Process -Id $Process.Id -ErrorAction Stop | Select-Object -ExpandProperty Handles
+            if ($Handles -gt 1000) {
+                foreach ($SensitiveProc in $SensitiveProcesses) {
+                    $Target = Get-Process -Name $SensitiveProc -ErrorAction SilentlyContinue
+                    if ($Target) {
+                        Write-Output "[CredDump] SUSPICIOUS: $($Process.ProcessName) has excessive handles ($Handles) while $SensitiveProc is running"
+                    }
+                }
+            }
+        } catch {}
+    }
+}
+
+function Invoke-WMIPersistenceDetection {
+    $Filters = Get-CimInstance -Namespace root\subscription -ClassName __EventFilter -ErrorAction SilentlyContinue
+    $Consumers = Get-CimInstance -Namespace root\subscription -ClassName CommandLineEventConsumer -ErrorAction SilentlyContinue
+
+    foreach ($Filter in $Filters) {
+        Write-Output "[WMI] Event filter found: $($Filter.Name) | Query: $($Filter.Query)"
+    }
+
+    foreach ($Consumer in $Consumers) {
+        Write-Output "[WMI] Command consumer found: $($Consumer.Name) | Command: $($Consumer.CommandLineTemplate)"
+    }
+}
+
+function Invoke-ScheduledTaskDetection {
+    $Tasks = Get-ScheduledTask | Where-Object { $_.State -eq "Ready" -and $_.Principal.UserId -notmatch "SYSTEM|Administrator" }
+
+    foreach ($Task in $Tasks) {
+        $Action = $Task.Actions[0].Execute
+        if ($Action -match "powershell|cmd|wscript|cscript|mshta") {
+            Write-Output "[ScheduledTask] SUSPICIOUS: $($Task.TaskName) | Action: $Action | User: $($Task.Principal.UserId)"
+        }
+    }
+}
+
+function Invoke-RegistryPersistenceDetection {
+    $RunKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+    )
+
+    foreach ($Key in $RunKeys) {
+        if (Test-Path $Key) {
+            $Values = Get-ItemProperty -Path $Key
+            foreach ($Property in $Values.PSObject.Properties) {
+                if ($Property.Name -notmatch "^PS" -and $Property.Value -match "powershell|cmd|http|\\.vbs|\\.js") {
+                    Write-Output "[Registry] SUSPICIOUS: $Key | Name: $($Property.Name) | Value: $($Property.Value)"
+                }
+            }
+        }
+    }
+}
+
+function Invoke-DLLHijackingDetection {
+    $Processes = Get-Process | Where-Object { $_.Path }
+
+    foreach ($Process in $Processes) {
+        try {
+            $Modules = $Process.Modules | Where-Object { $_.FileName -notmatch "^C:\\Windows" }
+            foreach ($Module in $Modules) {
+                $Signature = Get-AuthenticodeSignature -FilePath $Module.FileName -ErrorAction SilentlyContinue
+                if ($Signature.Status -ne "Valid") {
+                    Write-Output "[DLLHijack] SUSPICIOUS: Unsigned DLL loaded | Process: $($Process.ProcessName) | DLL: $($Module.FileName)"
+                }
+            }
+        } catch {}
+    }
+}
+
+function Invoke-TokenManipulationDetection {
+    $Processes = Get-Process | Where-Object { $_.Path }
+
+    foreach ($Process in $Processes) {
+        try {
+            $Owner = (Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)" -ErrorAction Stop).GetOwner()
+            if ($Owner.Domain -eq "NT AUTHORITY" -and $Process.Path -notmatch "^C:\\Windows") {
+                Write-Output "[TokenManip] SUSPICIOUS: Non-system binary running as SYSTEM | Process: $($Process.ProcessName) | Path: $($Process.Path)"
+            }
+        } catch {}
+    }
+}
+
+function Invoke-ProcessHollowingDetection {
+    $Processes = Get-Process | Where-Object { $_.Path }
+
+    foreach ($Process in $Processes) {
+        try {
+            $Modules = $Process.Modules
+            if ($Modules.Count -eq 0) {
+                Write-Output "[ProcessHollow] THREAT: Process with no modules | Process: $($Process.ProcessName) | PID: $($Process.Id)"
+            }
+        } catch {}
+    }
+}
+
+function Invoke-KeyloggerDetection {
+    $Hooks = Get-Process | Where-Object {
+        try {
+            $_.Modules.ModuleName -match "user32.dll" -and $_.ProcessName -notmatch "explorer|chrome|firefox"
+        } catch { $false }
+    }
+
+    foreach ($Process in $Hooks) {
+        Write-Output "[Keylogger] SUSPICIOUS: Potential keylogger | Process: $($Process.ProcessName) | PID: $($Process.Id)"
+    }
+}
+
+function Invoke-RansomwareDetection {
+    param([bool]$AutoKillThreats = $true)
+
+    $RansomwareIndicators = @(
+        "vssadmin delete shadows",
+        "wbadmin delete catalog",
+        "bcdedit /set {default} recoveryenabled no",
+        "wmic shadowcopy delete"
+    )
+
+    $Processes = Get-Process | Where-Object { $_.Path }
+
+    foreach ($Process in $Processes) {
+        try {
+            $CommandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)" -ErrorAction Stop).CommandLine
+
+            foreach ($Indicator in $RansomwareIndicators) {
+                if ($CommandLine -match [regex]::Escape($Indicator)) {
+                    Write-Output "[Ransomware] THREAT: Ransomware behavior detected | Process: $($Process.ProcessName) | PID: $($Process.Id) | Command: $CommandLine"
+
+                    if ($AutoKillThreats) {
+                        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                        Write-Output "[Ransomware] Terminated: $($Process.ProcessName)"
+                    }
+                    break
+                }
+            }
+        } catch {}
+    }
+}
+
+function Invoke-NetworkAnomalyDetection {
+    $Connections = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue
+
+    foreach ($Conn in $Connections) {
+        if ($Conn.RemotePort -in @(4444, 5555, 8080, 1337, 31337)) {
+            Write-Output "[Network] SUSPICIOUS: Connection to suspicious port | Remote: $($Conn.RemoteAddress):$($Conn.RemotePort) | PID: $($Conn.OwningProcess)"
+        }
+    }
+}
+
+function Invoke-NetworkTrafficMonitoring {
+    param(
+        [bool]$AutoBlockThreats = $true
+    )
+
+    $AllowedDomains = @("google.com", "microsoft.com", "github.com", "stackoverflow.com")
+    $AllowedIPs = @()
+
+    foreach ($Domain in $AllowedDomains) {
+        try {
+            $IPs = [System.Net.Dns]::GetHostAddresses($Domain) | ForEach-Object { $_.IPAddressToString }
+            foreach ($IP in $IPs) {
+                if ($AllowedIPs -notcontains $IP) {
+                    $AllowedIPs += $IP
+                }
+            }
+        }
+        catch {
+            Write-Output "[NTM] WARNING: Could not resolve domain $Domain to IP"
+        }
+    }
+
+    Write-Output "[NTM] Starting network traffic monitoring..."
+
+    try {
+        $Connections = Get-NetTCPConnection -ErrorAction SilentlyContinue |
+            Where-Object { $_.State -eq "Established" -and $_.RemoteAddress -ne "127.0.0.1" -and $_.RemoteAddress -ne "::1" }
+
+        $SuspiciousConnections = @()
+        $TotalConnections = $Connections.Count
+
+        foreach ($Connection in $Connections) {
+            $RemoteAddr = $Connection.RemoteAddress
+            $RemotePort = $Connection.RemotePort
+            $ProcessId = $Connection.OwningProcess
+
+            if ($AllowedIPs -contains $RemoteAddr) {
+                continue
+            }
+
+            $ProcessName = "Unknown"
+            $ProcessPath = "Unknown"
+
+            try {
+                $Process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+                if ($Process) {
+                    $ProcessName = $Process.ProcessName
+                    $ProcessPath = if ($Process.Path) { $Process.Path } else { "Unknown" }
+                }
+            }
+            catch {
+            }
+
+            $SuspiciousScore = 0
+            $Reasons = @()
+
+            if ($RemotePort -gt 10000) {
+                $SuspiciousScore += 20
+                $Reasons += "High remote port: $RemotePort"
+            }
+
+            $C2Ports = @(4444, 8080, 9999, 1337, 31337, 443, 53)
+            if ($C2Ports -contains $RemotePort) {
+                $SuspiciousScore += 30
+                $Reasons += "Known C2 port: $RemotePort"
+            }
+
+            $SuspiciousProcesses = @("powershell", "cmd", "wscript", "cscript", "rundll32", "mshta")
+            if ($SuspiciousProcesses -contains $ProcessName.ToLower()) {
+                $SuspiciousScore += 25
+                $Reasons += "Suspicious process: $ProcessName"
+            }
+
+            if ($ProcessPath -notmatch "C:\\(Windows|Program Files|Program Files \(x86\))" -and $ProcessPath -ne "Unknown") {
+                $SuspiciousScore += 15
+                $Reasons += "Process in non-standard location"
+            }
+
+            if ($RemoteAddr -match '^\d+\.\d+\.\d+\.\d+$') {
+                try {
+                    $HostName = [System.Net.Dns]::GetHostEntry($RemoteAddr).HostName
+                    if ($HostName -and $HostName -notmatch ($AllowedDomains -join '|')) {
+                        $SuspiciousScore += 10
+                        $Reasons += "Unknown hostname: $HostName"
+                    }
+                }
+                catch {
+                    $SuspiciousScore += 5
+                    $Reasons += "No reverse DNS for IP"
+                }
+            }
+
+            $PrivateIPRanges = @("10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.", "127.", "169.254.")
+            $IsPrivateIP = $false
+            foreach ($Range in $PrivateIPRanges) {
+                if ($RemoteAddr.StartsWith($Range)) {
+                    $IsPrivateIP = $true
+                    break
+                }
+            }
+
+            if (!$IsPrivateIP -and $AllowedIPs -notcontains $RemoteAddr) {
+                $SuspiciousScore += 10
+                $Reasons += "Unknown public IP"
+            }
+
+            if ($SuspiciousScore -ge 30) {
+                $SuspiciousConnections += @{
+                    RemoteAddress = $RemoteAddr
+                    RemotePort = $RemotePort
+                    ProcessName = $ProcessName
+                    ProcessId = $ProcessId
+                    ProcessPath = $ProcessPath
+                    Score = $SuspiciousScore
+                    Reasons = $Reasons
+                }
+
+                Write-Output "[NTM] SUSPICIOUS: $ProcessName connecting to $RemoteAddr`:$RemotePort | Score: $SuspiciousScore | Reasons: $($Reasons -join ', ')"
+            }
+        }
+
+        if ($AutoBlockThreats -and $SuspiciousConnections.Count -gt 0) {
+            foreach ($Suspicious in $SuspiciousConnections) {
+                try {
+                    $RuleName = "Block_Malicious_$($Suspicious.RemoteAddress)_$((Get-Date).ToString('yyyyMMddHHmmss'))"
+                    New-NetFirewallRule -DisplayName $RuleName -Direction Outbound -RemoteAddress $Suspicious.RemoteAddress -Action Block -Profile Any -ErrorAction SilentlyContinue | Out-Null
+
+                    Write-Output "[NTM] ACTION: Blocked IP $($Suspicious.RemoteAddress) with firewall rule $RuleName"
+
+                    if ($Suspicious.Score -ge 50) {
+                        Stop-Process -Id $Suspicious.ProcessId -Force -ErrorAction SilentlyContinue
+                        Write-Output "[NTM] ACTION: Terminated suspicious process $($Suspicious.ProcessName) (PID: $($Suspicious.ProcessId))"
+                    }
+                }
+                catch {
+                    Write-Output "[NTM] ERROR: Failed to block threat: $_"
+                }
+            }
+        }
+
+        Write-Output "[NTM] Monitoring complete: $TotalConnections total connections, $($SuspiciousConnections.Count) suspicious"
+    }
+    catch {
+        Write-Output "[NTM] ERROR: Failed to monitor network traffic: $_"
+    }
+}
+
+function Invoke-RootkitDetection {
+    $Drivers = Get-WindowsDriver -Online -ErrorAction SilentlyContinue
+
+    foreach ($Driver in $Drivers) {
+        if ($Driver.ProviderName -notmatch "Microsoft" -and $Driver.ClassName -eq "System") {
+            Write-Output "[Rootkit] SUSPICIOUS: Third-party system driver | Driver: $($Driver.DriverName) | Provider: $($Driver.ProviderName)"
+        }
+    }
+}
+
+function Invoke-ClipboardMonitoring {
+    try {
+        $ClipboardText = Get-Clipboard -Format Text -ErrorAction SilentlyContinue
+        if ($ClipboardText -match "password|api[_-]?key|token|secret") {
+            Write-Output "[Clipboard] WARNING: Sensitive data detected in clipboard"
+        }
+    } catch {}
+}
+
+function Invoke-COMMonitoring {
+    param(
+        [hashtable]$Config
+    )
+    
+    $COMKeys = @(
+        "HKLM:\SOFTWARE\Classes\CLSID"
+    )
+
+    foreach ($Key in $COMKeys) {
+        $RecentCOM = Get-ChildItem -Path $Key -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSChildName -match "^\{[A-F0-9-]+\}$" } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 5
+
+        foreach ($COM in $RecentCOM) {
+            Write-Output "[COM] Recently modified COM object: $($COM.PSChildName) | Modified: $($COM.LastWriteTime)"
+        }
+    }
+}
+
+function Invoke-BrowserExtensionMonitoring {
+    $ExtensionPaths = @(
+        "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Extensions",
+        "$env:APPDATA\Mozilla\Firefox\Profiles\*\extensions",
+        "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Extensions"
+    )
+
+    foreach ($Path in $ExtensionPaths) {
+        if (Test-Path $Path) {
+            $Extensions = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue
+            foreach ($Ext in $Extensions) {
+                $ManifestPath = Join-Path $Ext.FullName "manifest.json"
+                if (Test-Path $ManifestPath) {
+                    $Manifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    $DangerousPermissions = @("tabs", "webRequest", "cookies", "history", "downloads", "clipboardWrite")
+
+                    $HasDangerous = $false
+                    foreach ($Perm in $Manifest.permissions) {
+                        if ($DangerousPermissions -contains $Perm) {
+                            $HasDangerous = $true
+                            break
+                        }
+                    }
+
+                    if ($HasDangerous) {
+                        Write-Output "[BrowserExt] SUSPICIOUS: Extension with dangerous permissions | Name: $($Manifest.name) | Permissions: $($Manifest.permissions -join ', ')"
+                    }
+                }
+            }
+        }
+    }
+}
+
+function Invoke-ShadowCopyMonitoring {
+    $ShadowCopies = Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue
+    $CurrentCount = $ShadowCopies.Count
+
+    if (-not $Global:BaselineShadowCopyCount) {
+        $Global:BaselineShadowCopyCount = $CurrentCount
+    }
+
+    if ($CurrentCount -lt $Global:BaselineShadowCopyCount) {
+        $Deleted = $Global:BaselineShadowCopyCount - $CurrentCount
+        Write-Output "[ShadowCopy] THREAT: Shadow copies deleted | Deleted: $Deleted | Remaining: $CurrentCount"
+        $Global:BaselineShadowCopyCount = $CurrentCount
+    }
+}
+
+function Invoke-USBMonitoring {
+    $USBDevices = Get-PnpDevice -Class "USB" -Status "OK" -ErrorAction SilentlyContinue
+
+    foreach ($Device in $USBDevices) {
+        if ($Device.FriendlyName -match "Keyboard|HID") {
+            Write-Output "[USB] ALERT: USB HID device connected | Device: $($Device.FriendlyName) | InstanceId: $($Device.InstanceId)"
+        }
+
+        if ($Device.FriendlyName -match "Mass Storage") {
+            $RemovableDrives = Get-WmiObject -Class Win32_LogicalDisk -Filter "DriveType=2" -ErrorAction SilentlyContinue
+
+            foreach ($Drive in $RemovableDrives) {
+                $AutoRunPath = "$($Drive.DeviceID)\autorun.inf"
+                if (Test-Path $AutoRunPath) {
+                    Write-Output "[USB] THREAT: Autorun.inf detected on removable drive | Path: $AutoRunPath"
+                }
+            }
+        }
+    }
+}
+
+function Invoke-EventLogMonitoring {
+    $ClearedLogs = Get-WinEvent -FilterHashtable @{LogName='Security';ID=1102} -MaxEvents 10 -ErrorAction SilentlyContinue
+
+    foreach ($Event in $ClearedLogs) {
+        Write-Output "[EventLog] THREAT: Security log cleared | Time: $($Event.TimeCreated) | User: $($Event.Properties[1].Value)"
+    }
+
+    $FailedLogons = Get-WinEvent -FilterHashtable @{LogName='Security';ID=4625} -MaxEvents 20 -ErrorAction SilentlyContinue
+    $RecentFailed = $FailedLogons | Group-Object {$_.Properties[5].Value} | Where-Object {$_.Count -gt 5}
+
+    foreach ($Account in $RecentFailed) {
+        Write-Output "[EventLog] THREAT: Brute force attempt detected | Account: $($Account.Name) | Attempts: $($Account.Count)"
+    }
+}
+
+function Invoke-FirewallRuleMonitoring {
+    if (-not $Global:BaselineFirewallRules) {
+        $Global:BaselineFirewallRules = Get-NetFirewallRule | Select-Object -ExpandProperty Name
+    }
+
+    $CurrentRules = Get-NetFirewallRule | Select-Object -ExpandProperty Name
+    $NewRules = $CurrentRules | Where-Object { $_ -notin $Global:BaselineFirewallRules }
+
+    foreach ($Rule in $NewRules) {
+        $RuleDetails = Get-NetFirewallRule -Name $Rule
+        Write-Output "[Firewall] NEW RULE: $($RuleDetails.DisplayName) | Action: $($RuleDetails.Action) | Direction: $($RuleDetails.Direction)"
+    }
+
+    $Global:BaselineFirewallRules = $CurrentRules
+}
+
+function Invoke-ServiceMonitoring {
+    if (-not $Global:BaselineServices) {
+        $Global:BaselineServices = Get-Service | Select-Object -ExpandProperty Name
+    }
+
+    $CurrentServices = Get-Service | Select-Object -ExpandProperty Name
+    $NewServices = $CurrentServices | Where-Object { $_ -notin $Global:BaselineServices }
+
+    foreach ($ServiceName in $NewServices) {
+        $Service = Get-Service -Name $ServiceName
+        $ServiceDetails = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+
+        if ($ServiceDetails.PathName -notmatch "^C:\\Windows") {
+            Write-Output "[Service] NEW SERVICE: $($Service.DisplayName) | Status: $($Service.Status) | Path: $($ServiceDetails.PathName)"
+        }
+    }
+
+    $Global:BaselineServices = $CurrentServices
+}
+
+function Invoke-FilelessDetection {
+    $PSProcesses = Get-Process | Where-Object { $_.ProcessName -match "powershell|pwsh" }
+
+    foreach ($Process in $PSProcesses) {
+        try {
+            $CommandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)" -ErrorAction Stop).CommandLine
+            if ($CommandLine -match "-enc|-EncodedCommand") {
+                Write-Output "[Fileless] THREAT: Encoded PowerShell detected | PID: $($Process.Id)"
+            }
+        } catch {}
+    }
+}
+
+function Invoke-MemoryScanning {
+    param([bool]$AutoKillThreats = $true)
+
+    $Processes = Get-Process | Where-Object { $_.WorkingSet64 -gt 100MB }
+
+    foreach ($Process in $Processes) {
+        try {
+            if ($Process.PrivateMemorySize64 -gt $Process.WorkingSet64 * 2) {
+                Write-Output "[MemoryScan] SUSPICIOUS: Memory anomaly | Process: $($Process.ProcessName) | PID: $($Process.Id) | Private: $([Math]::Round($Process.PrivateMemorySize64/1MB)) MB"
+            }
+        } catch {}
+    }
+}
+
+function Invoke-NamedPipeMonitoring {
+    $Pipes = [System.IO.Directory]::GetFiles("\\.\pipe\")
+    $SuspiciousPipes = @("msagent_", "mojo", "crashpad", "mypipe", "evil")
+
+    foreach ($Pipe in $Pipes) {
+        foreach ($Pattern in $SuspiciousPipes) {
+            if ($Pipe -match $Pattern) {
+                Write-Output "[NamedPipe] SUSPICIOUS: $Pipe"
+            }
+        }
+    }
+}
+
+function Invoke-DNSExfiltrationDetection {
+    $DNSCache = Get-DnsClientCache -ErrorAction SilentlyContinue
+
+    foreach ($Entry in $DNSCache) {
+        if ($Entry.Name.Length -gt 50 -and $Entry.Name -match "[0-9a-f]{32,}") {
+            Write-Output "[DNSExfil] SUSPICIOUS: Long subdomain detected | Domain: $($Entry.Name)"
+        }
+    }
+}
+
+function Invoke-PasswordManagement {
+    param(
+        [bool]$EnablePasswordRotation = $false,
+        [int]$RotationMinutes = 10,
+        [bool]$ResetOnShutdown = $true
+    )
+
+    Write-Output "[Password] Starting password management monitoring..."
+
+    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole("Administrator")) {
+        Write-Output "[Password] WARNING: Not running as Administrator - limited functionality"
+        $IsAdmin = $false
+    }
+    else {
+        $IsAdmin = $true
+        Write-Output "[Password] Running with Administrator privileges"
+    }
+
+    function Test-PasswordSecurity {
+        try {
+            $CurrentUser = Get-LocalUser -Name $env:USERNAME -ErrorAction SilentlyContinue
+            if ($CurrentUser) {
+                $PasswordAge = (Get-Date) - $CurrentUser.PasswordLastSet
+                $DaysSinceChange = $PasswordAge.Days
+
+                if ($DaysSinceChange -gt 90) {
+                    Write-Output "[Password] WARNING: Password is $DaysSinceChange days old - consider rotation"
+                }
+
+                if ($CurrentUser.PasswordRequired -eq $false) {
+                    Write-Output "[Password] WARNING: Account does not require password"
+                }
+
+                $PasswordPolicy = Get-LocalUser | Where-Object { $_.Name -eq $env:USERNAME } | Select-Object PasswordRequired, PasswordChangeable, PasswordExpires
+                if ($PasswordPolicy) {
+                    Write-Output "[Password] INFO: Password policy - Required: $($PasswordPolicy.PasswordRequired), Changeable: $($PasswordPolicy.PasswordChangeable), Expires: $($PasswordPolicy.PasswordExpires)"
+                }
+
+                return @{
+                    DaysSinceChange = $DaysSinceChange
+                    PasswordRequired = $CurrentUser.PasswordRequired
+                    PasswordLastSet = $CurrentUser.PasswordLastSet
+                }
+            }
+        }
+        catch {
+            Write-Output "[Password] ERROR: Failed to check password security: $_"
+            return $null
+        }
+    }
+
+    function Test-SuspiciousPasswordActivity {
+        try {
+            $SecurityEvents = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4724,4723,4738} -MaxEvents 10 -ErrorAction SilentlyContinue
+
+            $RecentChanges = $SecurityEvents | Where-Object {
+                $_.TimeCreated -gt (Get-Date).AddHours(-1) -and
+                $_.Properties[0].Value -eq $env:USERNAME
+            }
+
+            if ($RecentChanges.Count -gt 0) {
+                Write-Output "[Password] WARNING: Recent password activity detected - $($RecentChanges.Count) events in last hour"
+
+                foreach ($Event in $RecentChanges) {
+                    $EventType = switch ($Event.Id) {
+                        4723 { "Password change attempted" }
+                        4724 { "Password reset attempted" }
+                        4738 { "Account policy modified" }
+                        default { "Unknown event" }
+                    }
+                    Write-Output "[Password]   - $EventType at $($Event.TimeCreated)"
+                }
+            }
+
+            $FailedLogons = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4625} -MaxEvents 50 -ErrorAction SilentlyContinue |
+                Where-Object { $_.TimeCreated -gt (Get-Date).AddHours(-1) }
+
+            $UserFailedLogons = $FailedLogons | Where-Object {
+                $_.Properties[5].Value -eq $env:USERNAME
+            }
+
+            if ($UserFailedLogons.Count -gt 5) {
+                Write-Output "[Password] THREAT: High number of failed logons - $($UserFailedLogons.Count) failures in last hour"
+            }
+
+            return @{
+                RecentChanges = $RecentChanges.Count
+                FailedLogons = $UserFailedLogons.Count
+            }
+        }
+        catch {
+            Write-Output "[Password] ERROR: Failed to check suspicious activity: $_"
+            return $null
+        }
+    }
+
+    function Test-PasswordDumpingTools {
+        try {
+            $SuspiciousTools = @("mimikatz", "procdump", "dumpert", "nanodump", "pypykatz", "gsecdump", "cachedump")
+            $SuspiciousProcesses = Get-Process | Where-Object {
+                $SuspiciousTools -contains $_.ProcessName.ToLower()
+            }
+
+            if ($SuspiciousProcesses.Count -gt 0) {
+                Write-Output "[Password] THREAT: Password dumping tools detected"
+                foreach ($Process in $SuspiciousProcesses) {
+                    Write-Output "[Password]   - $($Process.ProcessName) (PID: $($Process.Id))"
+                }
+            }
+
+            $PowerShellProcesses = Get-Process -Name "powershell" -ErrorAction SilentlyContinue
+            foreach ($Process in $PowerShellProcesses) {
+                try {
+                    $CommandLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($Process.Id)" -ErrorAction Stop).CommandLine
+
+                    $PasswordCommands = @("Get-Credential", "ConvertTo-SecureString", "Import-Clixml", "Export-Clixml")
+                    foreach ($Command in $PasswordCommands) {
+                        if ($CommandLine -match $Command) {
+                            Write-Output "[Password] SUSPICIOUS: PowerShell process with password-related command - PID: $($Process.Id)"
+                        }
+                    }
+                }
+                catch {
+                }
+            }
+
+            return $SuspiciousProcesses.Count
+        }
+        catch {
+            Write-Output "[Password] ERROR: Failed to check for dumping tools: $_"
+            return 0
+        }
+    }
+
+    try {
+        $PasswordStatus = Test-PasswordSecurity
+        if ($PasswordStatus) {
+            Write-Output "[Password] Security check completed - Password age: $($PasswordStatus.DaysSinceChange) days"
+        }
+
+        $ActivityStatus = Test-SuspiciousPasswordActivity
+        if ($ActivityStatus) {
+            Write-Output "[Password] Activity monitoring completed - Recent changes: $($ActivityStatus.RecentChanges), Failed logons: $($ActivityStatus.FailedLogons)"
+        }
+
+        $DumpingTools = Test-PasswordDumpingTools
+        Write-Output "[Password] Dumping tools check completed - Suspicious tools: $DumpingTools"
+
+        if ($EnablePasswordRotation -and $IsAdmin) {
+            Write-Output "[Password] Password rotation enabled - every $RotationMinutes minutes"
+            Write-Output "[Password] INFO: Password rotation requires scheduled task setup"
+        }
+
+        try {
+            $RegKeys = @(
+                "HKLM:\SAM\SAM\Domains\Account\Users",
+                "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+            )
+
+            foreach ($RegKey in $RegKeys) {
+                if (Test-Path $RegKey) {
+                    $RecentChanges = Get-ChildItem $RegKey -Recurse -ErrorAction SilentlyContinue |
+                        Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-1) }
+
+                    if ($RecentChanges.Count -gt 0) {
+                        Write-Output "[Password] WARNING: Recent registry changes in password-related areas"
+                        foreach ($Change in $RecentChanges) {
+                            Write-Output "[Password]   - $($Change.PSPath) modified at $($Change.LastWriteTime)"
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Output "[Password] ERROR: Failed to check registry changes: $_"
+        }
+
+        Write-Output "[Password] Password management monitoring completed"
+    }
+    catch {
+        Write-Output "[Password] ERROR: Monitoring failed: $_"
+    }
+}
+
+function Invoke-KeyScramblerManagement {
+    param(
+        [string]$InstallPath = "$env:LOCALAPPDATA\KeyScrambler",
+        [bool]$AutoInstall = $true,
+        [bool]$AutoStart = $true
+    )
+
+    $KeyScramblerExecutable = Join-Path $InstallPath "KeyScrambler.exe"
+    $KeyScramblerConfig = Join-Path $InstallPath "settings.ini"
+    $KeyScramblerRunning = $false
+
+    Write-Output "[KeyScrambler] Starting KeyScrambler management..."
+
+    if (Test-Path $KeyScramblerExecutable) {
+        Write-Output "[KeyScrambler] Found existing installation at $InstallPath"
+
+        try {
+            $KeyScramblerProcess = Get-Process -Name "KeyScrambler" -ErrorAction SilentlyContinue
+            if ($KeyScramblerProcess) {
+                $KeyScramblerRunning = $true
+                Write-Output "[KeyScrambler] KeyScrambler is already running (PID: $($KeyScramblerProcess.Id))"
+            }
+        }
+        catch {
+            Write-Output "[KeyScrambler] KeyScrambler not currently running"
+        }
+    }
+    else {
+        Write-Output "[KeyScrambler] KeyScrambler not installed"
+
+        if ($AutoInstall) {
+            Write-Output "[KeyScrambler] Auto-install enabled - attempting deployment..."
+
+            if (!(Test-Path $InstallPath)) {
+                try {
+                    New-Item -ItemType Directory -Path $InstallPath -Force -ErrorAction Stop | Out-Null
+                    Write-Output "[KeyScrambler] Created installation directory: $InstallPath"
+                }
+                catch {
+                    Write-Output "[KeyScrambler] ERROR: Failed to create installation directory: $_"
+                    return
+                }
+            }
+
+            try {
+                $DownloadUrl = "https://www.qfxsoftware.com/download/keyscrambler_setup.exe"
+                $SetupFile = Join-Path $env:TEMP "keyscrambler_setup.exe"
+
+                Write-Output "[KeyScrambler] NOTE: Auto-install requires manual download of KeyScrambler from QFX Software"
+                Write-Output "[KeyScrambler] Please download from: https://www.qfxsoftware.com/"
+                Write-Output "[KeyScrambler] Install to: $InstallPath"
+
+                $PlaceholderContent = @"
+@echo off
+echo KeyScrambler Placeholder
+echo This is a placeholder for the actual KeyScrambler executable
+echo Please install the real KeyScrambler from QFX Software
+pause
+"@
+                $PlaceholderContent | Out-File -FilePath $KeyScramblerExecutable -Encoding ASCII
+                Write-Output "[KeyScrambler] Created placeholder executable (replace with real KeyScrambler)"
+            }
+            catch {
+                Write-Output "[KeyScrambler] ERROR: Failed to setup KeyScrambler: $_"
+                return
+            }
+        }
+        else {
+            Write-Output "[KeyScrambler] Auto-install disabled - skipping installation"
+            return
+        }
+    }
+
+    try {
+        $ConfigContent = @"
+[Settings]
+AutoStart=1
+StartWithWindows=1
+EncryptClipboard=1
+EncryptAllApplications=1
+LogLevel=1
+UpdateCheck=1
+TrayIcon=1
+HotkeyEnabled=1
+Hotkey=Ctrl+Alt+K
+"@
+
+        $ConfigContent | Out-File -FilePath $KeyScramblerConfig -Encoding ASCII -Force
+        Write-Output "[KeyScrambler] Configuration updated"
+    }
+    catch {
+        Write-Output "[KeyScrambler] WARNING: Failed to create configuration: $_"
+    }
+
+    if (!$KeyScramblerRunning -and $AutoStart) {
+        try {
+            if (Test-Path $KeyScramblerExecutable) {
+                Start-Process -FilePath $KeyScramblerExecutable -WindowStyle Hidden -ErrorAction Stop
+                Write-Output "[KeyScrambler] Started KeyScrambler process"
+
+                Start-Sleep -Seconds 2
+                $VerifyProcess = Get-Process -Name "KeyScrambler" -ErrorAction SilentlyContinue
+                if ($VerifyProcess) {
+                    Write-Output "[KeyScrambler] KeyScrambler successfully started (PID: $($VerifyProcess.Id))"
+                }
+                else {
+                    Write-Output "[KeyScrambler] WARNING: KeyScrambler may not have started properly"
+                }
+            }
+            else {
+                Write-Output "[KeyScrambler] ERROR: KeyScrambler executable not found"
+            }
+        }
+        catch {
+            Write-Output "[KeyScrambler] ERROR: Failed to start KeyScrambler: $_"
+        }
+    }
+
+    try {
+        $StartupShortcut = Join-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" "KeyScrambler.lnk"
+
+        if ($AutoStart) {
+            $Shell = New-Object -ComObject WScript.Shell
+            $Shortcut = $Shell.CreateShortcut($StartupShortcut)
+            $Shortcut.TargetPath = $KeyScramblerExecutable
+            $Shortcut.WorkingDirectory = $InstallPath
+            $Shortcut.WindowStyle = 1
+            $Shortcut.Save()
+
+            Write-Output "[KeyScrambler] Created startup shortcut for automatic launch"
+        }
+        else {
+            if (Test-Path $StartupShortcut) {
+                Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
+                Write-Output "[KeyScrambler] Removed startup shortcut"
+            }
+        }
+    }
+    catch {
+        Write-Output "[KeyScrambler] WARNING: Failed to manage startup shortcut: $_"
+    }
+
+    try {
+        $FirewallRule = Get-NetFirewallRule -DisplayName "KeyScrambler" -ErrorAction SilentlyContinue
+        if (!$FirewallRule) {
+            New-NetFirewallRule -DisplayName "KeyScrambler" -Direction Outbound -Program $KeyScramblerExecutable -Action Allow -Profile Any -Description "Allow KeyScrambler outbound connections" -ErrorAction SilentlyContinue
+            Write-Output "[KeyScrambler] Added firewall exception"
+        }
+    }
+    catch {
+        Write-Output "[KeyScrambler] WARNING: Failed to configure firewall: $_"
+    }
+
+    try {
+        $CurrentProcess = Get-Process -Name "KeyScrambler" -ErrorAction SilentlyContinue
+        if ($CurrentProcess) {
+            $MemoryUsage = [Math]::Round($CurrentProcess.WorkingSet64 / 1MB, 2)
+            $StartTime = $CurrentProcess.StartTime
+            $RunTime = (Get-Date) - $StartTime
+
+            Write-Output "[KeyScrambler] STATUS: Running | PID: $($CurrentProcess.Id) | Memory: ${MemoryUsage}MB | Runtime: $([Math]::Round($RunTime.TotalMinutes, 1))min"
+        }
+        else {
+            Write-Output "[KeyScrambler] STATUS: Not running"
+        }
+    }
+    catch {
+        Write-Output "[KeyScrambler] ERROR: Failed to get process status: $_"
+    }
+
+    try {
+        $Processes = Get-Process | Where-Object { $_.Modules -ne $null }
+        $KeyScramblerHooks = 0
+
+        foreach ($Process in $Processes) {
+            try {
+                $KeyScramblerDLLs = $Process.Modules | Where-Object { $_.ModuleName -match "kscramble|keyscram" }
+                if ($KeyScramblerDLLs) {
+                    $KeyScramblerHooks += $KeyScramblerDLLs.Count
+                }
+            }
+            catch {
+            }
+        }
+
+        if ($KeyScramblerHooks -gt 0) {
+            Write-Output "[KeyScrambler] ENCRYPTION: Active - $KeyScramblerHooks hooks detected"
+        }
+        else {
+            Write-Output "[KeyScrambler] ENCRYPTION: Not active or hooks not accessible"
+        }
+    }
+    catch {
+        Write-Output "[KeyScrambler] WARNING: Could not verify encryption status: $_"
+    }
+
+    Write-Output "[KeyScrambler] Management cycle completed"
+}
+
+function Invoke-YouTubeAdBlocker {
+    [CmdletBinding()]
+    param()
+
+    $Port = 8080
+    $results = @()
+
+    try {
+        $existingJob = Get-Job -Name "YouTubeAdBlockerProxy" -ErrorAction SilentlyContinue
+
+        if ($existingJob -and $existingJob.State -eq 'Running') {
+            $results += "[YouTubeAdBlocker] Proxy server running on port $Port"
+            return $results
+        }
+
+        Get-Job -Name "YouTubeAdBlockerProxy" -ErrorAction SilentlyContinue | Remove-Job -Force
+
+        $proxyJob = Start-Job -Name "YouTubeAdBlockerProxy" -ScriptBlock {
+            param($Port)
+
+            $ErrorActionPreference = "Continue"
+
+            $BlockedDomains = @(
+                "doubleclick.net",
+                "googlesyndication.com",
+                "googleadservices.com",
+                "google-analytics.com",
+                "2mdn.net",
+                "youtube.com/api/stats/ads",
+                "youtube.com/pagead/",
+                "youtube.com/ptracking",
+                "youtube.com/api/stats/qoe",
+                "s.youtube.com/api/stats/qoe",
+                "static.doubleclick.net"
+            )
+
+            $YouTubeScriptlet = @"
+<script>
+(function() {
+    'use strict';
+    console.log('[YT-AdBlock] Active');
+    if (window.ytInitialPlayerResponse) {
+        try {
+            if (window.ytInitialPlayerResponse.adPlacements) window.ytInitialPlayerResponse.adPlacements = [];
+            if (window.ytInitialPlayerResponse.playerAds) window.ytInitialPlayerResponse.playerAds = [];
+        } catch(e) {}
+    }
+    Object.defineProperty(window, 'ytInitialPlayerResponse', {
+        set: function(v) { if(v && typeof v === 'object') { v.adPlacements = []; v.playerAds = []; } this._ytInitialPlayerResponse = v; },
+        get: function() { return this._ytInitialPlayerResponse; }
+    });
+    const removeAds = () => {
+        ['.video-ads','.ytp-ad-module','.ytp-ad-overlay-container','ytd-display-ad-renderer','ytd-promoted-sparkles-web-renderer','#masthead-ad','.ytd-compact-promoted-item-renderer','ytd-ad-slot-renderer','yt-mealbar-promo-renderer','ytd-popup-container'].forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
+        const skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern');
+        if (skipBtn) skipBtn.click();
+        const video = document.querySelector('video.html5-main-video');
+        const adIndicator = document.querySelector('.ytp-ad-player-overlay');
+        if (video && adIndicator) video.currentTime = video.duration;
+    };
+    setInterval(removeAds, 500);
+    new MutationObserver(removeAds).observe(document.body, { childList: true, subtree: true });
+})();
+</script>
+"@
+
+            function Test-BlockedDomain {
+                param([string]$Url)
+                foreach ($domain in $BlockedDomains) {
+                    if ($Url -like "*$domain*") { return $true }
+                }
+                return $false
+            }
+
+            function Inject-YouTubeScript {
+                param([string]$HtmlContent)
+                if ($HtmlContent -match '</head>') {
+                    return $HtmlContent -replace '</head>', "$YouTubeScriptlet</head>"
+                } elseif ($HtmlContent -match '<body[^>]*>') {
+                    return $HtmlContent -replace '(<body[^>]*>)', "`$1$YouTubeScriptlet"
+                }
+                return $HtmlContent
+            }
+
+            function Handle-Request {
+                param($Context)
+                $request = $Context.Request
+                $response = $Context.Response
+
+                try {
+                    $method = $request.HttpMethod
+                    $requestUrl = $request.RawUrl
+
+                    if ($method -eq "CONNECT") {
+                        $response.StatusCode = 501
+                        $response.Close()
+                        return
+                    }
+
+                    $targetUrl = if ($requestUrl -match '^http') { $requestUrl } else { "http://$($request.Headers['Host'])$requestUrl" }
+
+                    if (Test-BlockedDomain -Url $targetUrl) {
+                        $response.StatusCode = 204
+                        $response.Close()
+                        return
+                    }
+
+                    $webRequest = [System.Net.HttpWebRequest]::Create($targetUrl)
+                    $webRequest.Method = $method
+                    $webRequest.UserAgent = $request.UserAgent
+                    $webRequest.Timeout = 30000
+
+                    foreach ($header in $request.Headers.AllKeys) {
+                        if ($header -notin @('Host', 'Connection', 'Proxy-Connection', 'Content-Length')) {
+                            try { $webRequest.Headers.Add($header, $request.Headers[$header]) } catch {}
+                        }
+                    }
+
+                    if ($method -in @('POST', 'PUT', 'PATCH') -and $request.HasEntityBody) {
+                        $webRequest.ContentLength = $request.ContentLength64
+                        $webRequest.ContentType = $request.ContentType
+                        $requestStream = $webRequest.GetRequestStream()
+                        $request.InputStream.CopyTo($requestStream)
+                        $requestStream.Close()
+                    }
+
+                    try {
+                        $webResponse = $webRequest.GetResponse()
+                    } catch [System.Net.WebException] {
+                        $webResponse = $_.Exception.Response
+                        if ($null -eq $webResponse) { throw }
+                    }
+
+                    $response.StatusCode = [int]$webResponse.StatusCode
+                    $response.StatusDescription = $webResponse.StatusDescription
+
+                    foreach ($header in $webResponse.Headers.AllKeys) {
+                        if ($header -notin @('Transfer-Encoding', 'Content-Length')) {
+                            try { $response.Headers.Add($header, $webResponse.Headers[$header]) } catch {}
+                        }
+                    }
+
+                    $responseStream = $webResponse.GetResponseStream()
+                    $reader = New-Object System.IO.StreamReader($responseStream)
+                    $content = $reader.ReadToEnd()
+                    $reader.Close()
+                    $responseStream.Close()
+                    $webResponse.Close()
+
+                    if ($webResponse.ContentType -like "*text/html*") {
+                        $content = Inject-YouTubeScript -HtmlContent $content
+                    }
+
+                    $buffer = [System.Text.Encoding]::UTF8.GetBytes($content)
+                    $response.ContentLength64 = $buffer.Length
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                    $response.Close()
+
+                } catch {
+                    try {
+                        $response.StatusCode = 502
+                        $response.Close()
+                    } catch {}
+                }
+            }
+
+            $listener = New-Object System.Net.HttpListener
+            $listener.Prefixes.Add("http://localhost:$Port/")
+            $listener.Prefixes.Add("http://127.0.0.1:$Port/")
+
+            try {
+                $listener.Start()
+                while ($listener.IsListening) {
+                    $context = $listener.GetContext()
+                    Handle-Request -Context $context
+                }
+            } catch {
+            } finally {
+                if ($listener.IsListening) { $listener.Stop() }
+                $listener.Close()
+            }
+        } -ArgumentList $Port
+
+        Start-Sleep -Milliseconds 500
+
+        $pacFile = "$env:TEMP\youtube-adblocker.pac"
+        $pacContent = @"
+function FindProxyForURL(url, host) {
+    if (shExpMatch(host, "*.youtube.com") ||
+        shExpMatch(host, "*.youtu.be") ||
+        shExpMatch(host, "youtube.com") ||
+        shExpMatch(host, "youtu.be")) {
+        return "PROXY 127.0.0.1:$Port";
+    }
+    return "DIRECT";
+}
+"@
+
+        Set-Content -Path $pacFile -Value $pacContent -Encoding ASCII -ErrorAction Stop
+
+        $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        Set-ItemProperty -Path $regPath -Name AutoConfigURL -Value "file:///$($pacFile -replace '\\','/')" -ErrorAction Stop
+        Set-ItemProperty -Path $regPath -Name ProxyEnable -Value 0 -ErrorAction Stop
+
+        try {
+            $signature = @'
+[DllImport("wininet.dll", SetLastError = true, CharSet=CharSet.Auto)]
+public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+'@
+            $wininet = Add-Type -MemberDefinition $signature -Name InternetSettings -Namespace Win32 -PassThru
+            $wininet::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+            $wininet::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+        } catch {}
+
+        $results += "[YouTubeAdBlocker] Proxy server started on port $Port"
+        $results += "[YouTubeAdBlocker] PAC file configured for YouTube-only proxying"
+        $results += "[YouTubeAdBlocker] Ad blocking active for YouTube traffic"
+
+    } catch {
+        $results += "[YouTubeAdBlocker] ERROR: $($_.Exception.Message)"
+    }
+
+    return $results
+}
+
+# ===================== Main =====================
+
+try {
+    if ($Uninstall) {
+        Uninstall-Antivirus
+    }
+
+    Write-Host "`nAntivirus Protection (Single File)`n" -ForegroundColor Cyan
+    Write-StabilityLog "=== Antivirus Starting ==="
+
+    Write-StabilityLog "Executing script path: $PSCommandPath" "INFO"
+
+    Register-ExitCleanup
+
+    Install-Antivirus
+    Initialize-Mutex
+
+    if (-not [System.Diagnostics.EventLog]::SourceExists($Config.EDRName)) {
+        New-EventLog -LogName Application -Source $Config.EDRName -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "[*] Starting detection jobs...`n" -ForegroundColor Cyan
+
+    $loaded = 0
+    $failed = 0
+
+    $moduleNames = @(
+        "HashDetection",
+        "LOLBinDetection",
+        "ProcessAnomalyDetection",
+        "AMSIBypassDetection",
+        "CredentialDumpDetection",
+        "WMIPersistenceDetection",
+        "ScheduledTaskDetection",
+        "RegistryPersistenceDetection",
+        "DLLHijackingDetection",
+        "TokenManipulationDetection",
+        "ProcessHollowingDetection",
+        "KeyloggerDetection",
+        "KeyScramblerManagement",
+        "RansomwareDetection",
+        "NetworkAnomalyDetection",
+        "NetworkTrafficMonitoring",
+        "RootkitDetection",
+        "ClipboardMonitoring",
+        "COMMonitoring",
+        "BrowserExtensionMonitoring",
+        "ShadowCopyMonitoring",
+        "USBMonitoring",
+        "EventLogMonitoring",
+        "FirewallRuleMonitoring",
+        "ServiceMonitoring",
+        "FilelessDetection",
+        "MemoryScanning",
+        "NamedPipeMonitoring",
+        "DNSExfiltrationDetection",
+        "PasswordManagement",
+        "YouTubeAdBlocker"
+    )
+
+    foreach ($modName in $moduleNames) {
+        $key = "${modName}IntervalSeconds"
+        $interval = if ($Script:ManagedJobConfig.ContainsKey($key)) { $Script:ManagedJobConfig[$key] } else { 60 }
+
+        try {
+            Start-ManagedJob -ModuleName $modName -IntervalSeconds $interval
+
+            if ($Global:AntivirusState.Jobs.ContainsKey("AV_$modName")) {
+                Write-Host "[+] $modName ($interval sec)" -ForegroundColor Green
+                Write-StabilityLog "Successfully started module: $modName"
+                $loaded++
+            }
+            else {
+                Write-Host "[!] $modName - skipped" -ForegroundColor Yellow
+                Write-StabilityLog "Module skipped: $modName" "WARN"
+                $failed++
+            }
+        }
+        catch {
+            Write-Host "[!] Failed to start $modName : $_" -ForegroundColor Red
+            Write-StabilityLog "Module start failed: $modName - $_" "ERROR"
+            Write-AVLog "Module start failed: $modName - $_" "ERROR"
+            $failed++
+        }
+    }
+
+    Write-Host "`n[+] Started $loaded modules" -ForegroundColor Green
+    if ($failed -gt 0) {
+        Write-Host "[!] $failed modules failed to start" -ForegroundColor Yellow
+    }
+
+    Write-StabilityLog "Module start complete: $loaded started, $failed failed"
+
+    try {
+        $mjCount = if ($script:ManagedJobs) { $script:ManagedJobs.Count } else { 0 }
+        Write-StabilityLog "Managed jobs registered after start: $mjCount" "INFO"
+        Write-Host "[AV] Managed jobs registered: $mjCount" -ForegroundColor DarkGray
+    }
+    catch {}
+
+    Write-Host "`n========================================" -ForegroundColor Green
+    Write-Host "  Antivirus Protection ACTIVE" -ForegroundColor Green
+    Write-Host "  Active jobs: $($Global:AntivirusState.Jobs.Count)" -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "`nPress Ctrl+C to stop`n" -ForegroundColor Yellow
+
+    Write-StabilityLog "Antivirus fully started with $($Global:AntivirusState.Jobs.Count) active jobs"
+    Write-AVLog "About to enter Monitor-Jobs loop"
+
+    Monitor-Jobs
+}
+catch {
+    $err = $_.Exception.Message
+    Write-Host "`n[!] Critical error: $err`n" -ForegroundColor Red
+    Write-StabilityLog "Critical startup error: $err" "ERROR"
+    Write-AVLog "Startup error: $err" "ERROR"
+
+    if ($err -like "*already running*") {
+        Write-Host "[i] Another instance is running. Exiting.`n" -ForegroundColor Yellow
+        Write-StabilityLog "Blocked duplicate instance - exiting" "INFO"
+        exit 1
+    }
+
+    Write-StabilityLog "Exiting due to startup failure" "ERROR"
+    exit 1
+}
