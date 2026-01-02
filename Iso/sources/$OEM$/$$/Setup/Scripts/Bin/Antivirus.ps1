@@ -11,7 +11,7 @@ param([switch]$Uninstall)
 
 $Script:InstallPath = "C:\ProgramData\AntivirusProtection"
 $Script:ModulesPath = "$Script:InstallPath\Modules"
-$Script:ScriptName = "Antivirus.ps1"
+$Script:ScriptName = Split-Path -Leaf $PSCommandPath
 $Script:MaxCacheSize = 10000
 
 $Script:ManagedJobConfig = @{
@@ -56,6 +56,16 @@ $Config = @{
     HMACKeyPath = "$Script:InstallPath\Data\db_integrity.hmac"
     PIDFilePath = "$Script:InstallPath\Data\antivirus.pid"
     MutexName = "Local\AntivirusProtection_Mutex"
+    
+    ExclusionPaths = @(
+        $Script:InstallPath,
+        $Script:ModulesPath,
+        "$Script:InstallPath\Logs",
+        "$Script:InstallPath\Quarantine",
+        "$Script:InstallPath\Reports",
+        "$Script:InstallPath\Data"
+    )
+    ExclusionProcesses = @("powershell", "pwsh")  # Whitelist PowerShell processes running our modules
     
     EnableHashDetection = $true
     EnableLOLBinDetection = $true
@@ -130,23 +140,94 @@ function Install-Antivirus {
     $CurrentScript = $PSCommandPath
     $TargetScript = Join-Path $Script:InstallPath $Script:ScriptName
     
-    if ($CurrentScript -ne $TargetScript) {
+    $CurrentDir = Split-Path -Parent $CurrentScript
+    
+    if ($CurrentDir -ne $Script:InstallPath) {
+        Write-Host "`n[!] INSTALLATION REQUIRED" -ForegroundColor Yellow
+        Write-Host "[!] This script must run from: $Script:InstallPath" -ForegroundColor Yellow
+        Write-Host "[!] Current location: $CurrentDir`n" -ForegroundColor Yellow
+        
+        Write-Host "[*] Copying files to installation directory..." -ForegroundColor Cyan
+        
+        # Copy core script
         Copy-Item -Path $CurrentScript -Destination $TargetScript -Force
         Write-Host "[+] Copied core script to: $TargetScript"
+        
+        # Copy all modules
+        $ModuleFiles = Get-ChildItem -Path $CurrentDir -Filter "*.psm1" -ErrorAction SilentlyContinue
+        
+        $ModuleCount = 0
+        foreach ($Module in $ModuleFiles) {
+            $TargetModule = Join-Path $Script:ModulesPath $Module.Name
+            Copy-Item -Path $Module.FullName -Destination $TargetModule -Force
+            Write-Host "[+] Copied module: $($Module.Name)"
+            $ModuleCount++
+        }
+        
+        # Copy UnsignedDLL-Scanner if exists
+        $UnsignedDLLScanner = Join-Path $CurrentDir "UnsignedDLL-Scanner.ps1"
+        if (Test-Path $UnsignedDLLScanner) {
+            Copy-Item -Path $UnsignedDLLScanner -Destination (Join-Path $Script:ModulesPath "UnsignedDLL-Scanner.ps1") -Force
+            Write-Host "[+] Copied UnsignedDLL-Scanner.ps1"
+        }
+        
+        Write-Host "`n[+] Total modules installed: $ModuleCount" -ForegroundColor Green
+        Write-Host "`n========================================" -ForegroundColor Green
+        Write-Host "  INSTALLATION COMPLETE!" -ForegroundColor Green
+        Write-Host "========================================" -ForegroundColor Green
+        Write-Host "`nTO START THE ANTIVIRUS:" -ForegroundColor Yellow
+        Write-Host "  Run this command:" -ForegroundColor Cyan
+        Write-Host "  powershell.exe -ExecutionPolicy Bypass -File `"$TargetScript`"`n" -ForegroundColor White
+        Write-Host "Or schedule a task pointing to: $TargetScript`n" -ForegroundColor Gray
+        
+        exit 0
     }
     
-    $CurrentDir = Split-Path -Parent $CurrentScript
-    $ModuleFiles = Get-ChildItem -Path $CurrentDir -Filter "*.psm1" -ErrorAction SilentlyContinue
+    $TargetScript = Join-Path $Script:InstallPath $Script:ScriptName
     
-    $ModuleCount = 0
-    foreach ($Module in $ModuleFiles) {
-        $TargetModule = Join-Path $Script:ModulesPath $Module.Name
-        Copy-Item -Path $Module.FullName -Destination $TargetModule -Force
-        Write-Host "[+] Copied module: $($Module.Name)"
-        $ModuleCount++
+    if ($CurrentScript -ne $TargetScript) {
+        Write-Host "[!] Running from source location. Installing to target directory..." -ForegroundColor Yellow
+        Copy-Item -Path $CurrentScript -Destination $TargetScript -Force
+        Write-Host "[+] Copied core script to: $TargetScript"
+        
+        # Copy all modules
+        $CurrentDir = Split-Path -Parent $CurrentScript
+        $ModuleFiles = Get-ChildItem -Path $CurrentDir -Filter "*.psm1" -ErrorAction SilentlyContinue
+        
+        $ModuleCount = 0
+        foreach ($Module in $ModuleFiles) {
+            $TargetModule = Join-Path $Script:ModulesPath $Module.Name
+            Copy-Item -Path $Module.FullName -Destination $TargetModule -Force
+            Write-Host "[+] Copied module: $($Module.Name)"
+            $ModuleCount++
+        }
+        
+        Write-Host "[+] Total modules installed: $ModuleCount" -ForegroundColor Green
+        
+        # Launch from installation directory and exit this instance
+        Write-Host "`n[+] Installation complete!" -ForegroundColor Green
+        Write-Host "[*] Launching antivirus from installation directory..." -ForegroundColor Cyan
+        Write-Host "[!] This instance will now exit.`n" -ForegroundColor Yellow
+        
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$TargetScript`"" -Verb RunAs
+        exit 0
     }
     
-    Write-Host "[+] Total modules installed: $ModuleCount" -ForegroundColor Green
+    # If we reach here, we're running from the installation directory
+    Write-Host "[+] Running from installation directory: $Script:InstallPath" -ForegroundColor Green
+    
+    # Update modules if any new ones exist
+    $SourceDir = Split-Path -Parent $CurrentScript
+    if ($SourceDir -ne $Script:InstallPath) {
+        $SourceModules = Get-ChildItem -Path $SourceDir -Filter "*.psm1" -ErrorAction SilentlyContinue
+        foreach ($Module in $SourceModules) {
+            $TargetModule = Join-Path $Script:ModulesPath $Module.Name
+            if (!(Test-Path $TargetModule) -or (Get-Item $Module.FullName).LastWriteTime -gt (Get-Item $TargetModule).LastWriteTime) {
+                Copy-Item -Path $Module.FullName -Destination $TargetModule -Force
+                Write-Host "[+] Updated module: $($Module.Name)"
+            }
+        }
+    }
     
     try {
         New-EventLog -LogName Application -Source $Config.EDRName -ErrorAction SilentlyContinue
@@ -265,11 +346,15 @@ function Start-ManagedJob {
     }
     
     $Job = Start-Job -Name $JobName -ScriptBlock {
-        param($ModulePath, $Interval, $Params, $ConfigData)
+        param($ModulePath, $Interval, $Params, $ConfigData, $ExclusionPaths, $ExclusionProcesses)
         
         Import-Module $ModulePath -Force
         $ModuleName = [System.IO.Path]::GetFileNameWithoutExtension($ModulePath)
         $FunctionName = "Invoke-$ModuleName"
+        
+        # Merge exclusions into config
+        $ConfigData.ExclusionPaths = $ExclusionPaths
+        $ConfigData.ExclusionProcesses = $ExclusionProcesses
         
         while ($true) {
             try {
@@ -279,19 +364,31 @@ function Start-ManagedJob {
             }
             Start-Sleep -Seconds $Interval
         }
-    } -ArgumentList (Join-Path $Script:ModulesPath "$ModuleName.psm1"), $IntervalSeconds, $Parameters, $Config
+    } -ArgumentList (Join-Path $Script:ModulesPath "$ModuleName.psm1"), $IntervalSeconds, $Parameters, $Config, $Config.ExclusionPaths, $Config.ExclusionProcesses
     
     $Global:AntivirusState.Jobs[$JobName] = $Job
     Write-AVLog "Started job: $JobName (Interval: ${IntervalSeconds}s)"
 }
 
 function Monitor-Jobs {
-    while ($Global:AntivirusState.Running) {
+    Write-Host "[*] Job monitoring started. Running infinite loop..." -ForegroundColor Cyan
+    
+    $LoopCount = 0
+    while ($true) {  # True infinite loop, not dependent on state variable
+        $LoopCount++
+        
+        # Every 12 iterations (60 seconds), show we're alive
+        if ($LoopCount % 12 -eq 0) {
+            $JobCount = $Global:AntivirusState.Jobs.Count
+            Write-Host "[v0] Monitor loop active - Jobs: $JobCount - Time: $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor DarkGray
+        }
+        
         foreach ($JobName in @($Global:AntivirusState.Jobs.Keys)) {
             $Job = $Global:AntivirusState.Jobs[$JobName]
             
             if ($Job.State -eq "Failed") {
                 Write-AVLog "Job $JobName failed, restarting..." "WARN"
+                Write-Host "[!] Job $JobName failed, restarting..." -ForegroundColor Yellow
                 Remove-Job -Name $JobName -Force
                 $Global:AntivirusState.Jobs.Remove($JobName)
             }
@@ -299,6 +396,7 @@ function Monitor-Jobs {
             $Output = Receive-Job -Job $Job -ErrorAction SilentlyContinue
             if ($Output) {
                 foreach ($Line in $Output) {
+                    Write-Host "[Job Output] $Line" -ForegroundColor Gray
                     Write-AVLog $Line
                 }
             }
@@ -378,7 +476,11 @@ try {
     Write-Host "`n[*] Starting Unsigned DLL Scanner..." -ForegroundColor Cyan
     Start-UnsignedDLLScanner
     
-    Write-Host "[*] Monitoring active - Press Ctrl+C to stop`n" -ForegroundColor Yellow
+    Write-Host "`n========================================" -ForegroundColor Green
+    Write-Host "  Antivirus Protection is now ACTIVE" -ForegroundColor Green
+    Write-Host "  Active Jobs: $($Global:AntivirusState.Jobs.Count)" -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "`n[*] Press Ctrl+C to stop all modules and exit`n" -ForegroundColor Yellow
     
     Monitor-Jobs
 
@@ -394,13 +496,27 @@ try {
     }
     
     Write-Host "[*] Attempting to continue despite error..." -ForegroundColor Yellow
+    if ($Global:AntivirusState.Jobs.Count -gt 0) {
+        Write-Host "[*] Monitoring active jobs..." -ForegroundColor Yellow
+        Monitor-Jobs
+    }
 } finally {
+    Write-Host "`n[*] Shutting down antivirus protection..." -ForegroundColor Yellow
+    
     if ($Global:AntivirusState.Mutex) {
         $Global:AntivirusState.Mutex.ReleaseMutex()
         $Global:AntivirusState.Mutex.Dispose()
     }
+    
+    Write-Host "[*] Stopping all jobs..."
     foreach ($JobName in $Global:AntivirusState.Jobs.Keys) {
         Stop-Job -Name $JobName -ErrorAction SilentlyContinue
         Remove-Job -Name $JobName -Force -ErrorAction SilentlyContinue
     }
+    
+    if (Test-Path $Config.PIDFilePath) {
+        Remove-Item $Config.PIDFilePath -Force -ErrorAction SilentlyContinue
+    }
+    
+    Write-Host "[+] Antivirus protection stopped`n" -ForegroundColor Green
 }
