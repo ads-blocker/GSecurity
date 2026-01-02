@@ -88,6 +88,12 @@ $Global:AntivirusState = @{
 $Script:LoopCounter = 0
 $script:ManagedJobs = @{}
 
+# Termination protection variables
+$Script:TerminationAttempts = 0
+$Script:MaxTerminationAttempts = 5
+$Script:AutoRestart = $true
+$Script:SelfPID = $PID
+
 function Write-AVLog {
     param([string]$Message, [string]$Level = "INFO")
 
@@ -385,6 +391,138 @@ function Select-BoundConfig {
         }
     }
     return $bound
+}
+
+function Register-TerminationProtection {
+    try {
+        # Monitor for unexpected termination attempts
+        $Script:UnhandledExceptionHandler = Register-ObjectEvent -InputObject ([AppDomain]::CurrentDomain) `
+            -EventName UnhandledException -Action {
+            param($src, $evtArgs)
+            
+            $errorMsg = "Unhandled exception: $($evtArgs.Exception.ToString())"
+            $errorMsg | Out-File "$using:quarantineFolder\crash_log.txt" -Append
+            
+            try {
+                # Log to security events
+                $securityEvent = @{
+                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+                    EventType = "UnexpectedTermination"
+                    Severity = "Critical"
+                    Exception = $evtArgs.Exception.ToString()
+                    IsTerminating = $evtArgs.IsTerminating
+                }
+                $securityEvent | ConvertTo-Json -Compress | Out-File "$using:quarantineFolder\security_events.jsonl" -Append
+            } catch {}
+            
+            # Attempt auto-restart if configured
+            if ($using:Script:AutoRestart -and $evtArgs.IsTerminating) {
+                try {
+                    Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -File `"$using:Script:SelfPath`"" `
+                        -WindowStyle Hidden -ErrorAction SilentlyContinue
+                } catch {}
+            }
+        }
+        
+        Write-StabilityLog "[PROTECTION] Termination protection registered"
+        
+    } catch {
+        Write-StabilityLog -Message "Failed to register termination protection" -Severity "Medium" -ErrorRecord $_
+    }
+}
+
+function Enable-CtrlCProtection {
+    try {
+        # Detect if running in ISE or console
+        if ($host.Name -eq "Windows PowerShell ISE Host") {
+            Write-Host "[PROTECTION] ISE detected - using trap-based Ctrl+C protection" -ForegroundColor Cyan
+            Write-Host "[PROTECTION] Ctrl+C protection enabled (requires $Script:MaxTerminationAttempts attempts to stop)" -ForegroundColor Green
+            return $true
+        }
+        
+        [Console]::TreatControlCAsInput = $false
+        
+        # Create scriptblock for the event handler
+        $cancelHandler = {
+            param($src, $evtArgs)
+            
+            $Script:TerminationAttempts++
+            
+            Write-Host "`n[PROTECTION] Termination attempt detected ($Script:TerminationAttempts/$Script:MaxTerminationAttempts)" -ForegroundColor Red
+            
+            try {
+                Write-SecurityEvent -EventType "TerminationAttemptBlocked" -Details @{
+                    PID = $PID
+                    AttemptNumber = $Script:TerminationAttempts
+                } -Severity "Critical"
+            } catch {}
+            
+            if ($Script:TerminationAttempts -ge $Script:MaxTerminationAttempts) {
+                Write-Host "[PROTECTION] Maximum termination attempts reached. Allowing graceful shutdown..." -ForegroundColor Yellow
+                $evtArgs.Cancel = $false
+            } else {
+                Write-Host "[PROTECTION] Termination blocked. Press Ctrl+C $($Script:MaxTerminationAttempts - $Script:TerminationAttempts) more times to force stop." -ForegroundColor Yellow
+                $evtArgs.Cancel = $true
+            }
+        }
+        
+        # Register the event handler
+        [Console]::add_CancelKeyPress($cancelHandler)
+        
+        Write-Host "[PROTECTION] Ctrl+C protection enabled (requires $Script:MaxTerminationAttempts attempts to stop)" -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "[WARNING] Could not enable Ctrl+C protection: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+function Enable-AutoRestart {
+    try {
+        $taskName = "AntivirusAutoRestart_$PID"
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+            -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Script:SelfPath`""
+        
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+        
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -RunOnlyIfNetworkAvailable:$false
+        
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Settings $settings -Force -ErrorAction Stop | Out-Null
+        
+        Write-Host "[PROTECTION] Auto-restart scheduled task registered" -ForegroundColor Green
+    } catch {
+        Write-Host "[WARNING] Could not enable auto-restart: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+function Start-ProcessWatchdog {
+    try {
+        $watchdogJob = Start-Job -ScriptBlock {
+            param($parentPID, $scriptPath, $autoRestart)
+            
+            while ($true) {
+                Start-Sleep -Seconds 30
+                
+                # Check if parent process is still alive
+                $process = Get-Process -Id $parentPID -ErrorAction SilentlyContinue
+                
+                if (-not $process) {
+                    # Parent died - restart if configured
+                    if ($autoRestart) {
+                        Start-Process "powershell.exe" -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`"" `
+                            -WindowStyle Hidden -ErrorAction SilentlyContinue
+                    }
+                    break
+                }
+            }
+        } -ArgumentList $PID, $Script:SelfPath, $Script:AutoRestart
+        
+        Write-Host "[PROTECTION] Process watchdog started (Job ID: $($watchdogJob.Id))" -ForegroundColor Green
+    } catch {
+        Write-Host "[WARNING] Could not start process watchdog: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
 }
 
 function Register-ManagedJob {
@@ -1614,201 +1752,176 @@ function Invoke-PasswordManagement {
 
 function Invoke-KeyScramblerManagement {
     param(
-        [string]$InstallPath = "$env:LOCALAPPDATA\KeyScrambler",
-        [bool]$AutoInstall = $true,
         [bool]$AutoStart = $true
     )
 
-    $KeyScramblerExecutable = Join-Path $InstallPath "KeyScrambler.exe"
-    $KeyScramblerConfig = Join-Path $InstallPath "settings.ini"
-    $KeyScramblerRunning = $false
+    Write-Output "[KeyScrambler] Starting inline KeyScrambler with C# hook..."
 
-    Write-Output "[KeyScrambler] Starting KeyScrambler management..."
+    $Source = @"
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
 
-    if (Test-Path $KeyScramblerExecutable) {
-        Write-Output "[KeyScrambler] Found existing installation at $InstallPath"
+public class KeyScrambler
+{
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN = 0x0100;
 
-        try {
-            $KeyScramblerProcess = Get-Process -Name "KeyScrambler" -ErrorAction SilentlyContinue
-            if ($KeyScramblerProcess) {
-                $KeyScramblerRunning = $true
-                Write-Output "[KeyScrambler] KeyScrambler is already running (PID: $($KeyScramblerProcess.Id))"
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KBDLLHOOKSTRUCT
+    {
+        public uint vkCode;
+        public uint scanCode;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct INPUT
+    {
+        public uint type;
+        public INPUTUNION u;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    public struct INPUTUNION
+    {
+        [FieldOffset(0)] public KEYBDINPUT ki;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT
+    {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    private const uint INPUT_KEYBOARD = 1;
+    private const uint KEYEVENTF_UNICODE = 0x0004;
+    private const uint KEYEVENTF_KEYUP   = 0x0002;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, IntPtr lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll")] private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] private static extern bool GetMessage(out MSG msg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+    [DllImport("user32.dll")] private static extern bool TranslateMessage(ref MSG msg);
+    [DllImport("user32.dll")] private static extern IntPtr DispatchMessage(ref MSG msg);
+    [DllImport("user32.dll")] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    [DllImport("user32.dll")] private static extern IntPtr GetMessageExtraInfo();
+    [DllImport("user32.dll")] private static extern short GetKeyState(int nVirtKey);
+    [DllImport("kernel32.dll")] private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int x; public int y; }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+    private static IntPtr _hookID = IntPtr.Zero;
+    private static LowLevelKeyboardProc _proc;
+    private static Random _rnd = new Random();
+
+    public static void Start()
+    {
+        if (_hookID != IntPtr.Zero) return;
+
+        _proc = HookCallback;
+        _hookID = SetWindowsHookEx(WH_KEYBOARD_LL,
+            Marshal.GetFunctionPointerForDelegate(_proc),
+            GetModuleHandle(null), 0);
+
+        if (_hookID == IntPtr.Zero)
+            throw new Exception("Hook failed: " + Marshal.GetLastWin32Error());
+
+        Console.WriteLine("KeyScrambler ACTIVE — invisible mode ON");
+        Console.WriteLine("You see only your real typing • Keyloggers blinded");
+
+        MSG msg;
+        while (GetMessage(out msg, IntPtr.Zero, 0, 0))
+        {
+            TranslateMessage(ref msg);
+            DispatchMessage(ref msg);
+        }
+    }
+
+    private static bool ModifiersDown()
+    {
+        return (GetKeyState(0x10) & 0x8000) != 0 ||
+               (GetKeyState(0x11) & 0x8000) != 0 ||
+               (GetKeyState(0x12) & 0x8000) != 0;
+    }
+
+    private static void InjectFakeChar(char c)
+    {
+        var inputs = new INPUT[2];
+
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].u.ki.wVk = 0;
+        inputs[0].u.ki.wScan = (ushort)c;
+        inputs[0].u.ki.dwFlags = KEYEVENTF_UNICODE;
+        inputs[0].u.ki.dwExtraInfo = GetMessageExtraInfo();
+
+        inputs[1] = inputs[0];
+        inputs[1].u.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+        SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));
+        Thread.Sleep(_rnd.Next(1, 7));
+    }
+
+    private static void Flood()
+    {
+        if (_rnd.NextDouble() < 0.5) return;
+        int count = _rnd.Next(1, 7);
+        for (int i = 0; i < count; i++)
+            InjectFakeChar((char)_rnd.Next('A', 'Z' + 1));
+    }
+
+    private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && wParam == (IntPtr)WM_KEYDOWN)
+        {
+            KBDLLHOOKSTRUCT k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+
+            if ((k.flags & 0x10) != 0) return CallNextHookEx(_hookID, nCode, wParam, lParam);
+            if (ModifiersDown()) return CallNextHookEx(_hookID, nCode, wParam, lParam);
+
+            if (k.vkCode >= 65 && k.vkCode <= 90)
+            {
+                if (_rnd.NextDouble() < 0.75) Flood();
+                var ret = CallNextHookEx(_hookID, nCode, wParam, lParam);
+                if (_rnd.NextDouble() < 0.75) Flood();
+                return ret;
             }
+        }
+        return CallNextHookEx(_hookID, nCode, wParam, lParam);
+    }
+}
+"@
+
+    try {
+        Add-Type -TypeDefinition $Source -Language CSharp -ErrorAction Stop
+        Write-Output "[KeyScrambler] Compiled C# code successfully"
+    }
+    catch {
+        Write-Output "[KeyScrambler] ERROR: Compilation failed: $($_.Exception.Message)"
+        return
+    }
+
+    if ($AutoStart) {
+        try {
+            Write-Output "[KeyScrambler] Starting keyboard hook..."
+            [KeyScrambler]::Start()
         }
         catch {
-            Write-Output "[KeyScrambler] KeyScrambler not currently running"
+            Write-Output "[KeyScrambler] ERROR: Failed to start hook: $_"
         }
     }
-    else {
-        Write-Output "[KeyScrambler] KeyScrambler not installed"
-
-        if ($AutoInstall) {
-            Write-Output "[KeyScrambler] Auto-install enabled - attempting deployment..."
-
-            if (!(Test-Path $InstallPath)) {
-                try {
-                    New-Item -ItemType Directory -Path $InstallPath -Force -ErrorAction Stop | Out-Null
-                    Write-Output "[KeyScrambler] Created installation directory: $InstallPath"
-                }
-                catch {
-                    Write-Output "[KeyScrambler] ERROR: Failed to create installation directory: $_"
-                    return
-                }
-            }
-
-            try {
-                $DownloadUrl = "https://www.qfxsoftware.com/download/keyscrambler_setup.exe"
-                $SetupFile = Join-Path $env:TEMP "keyscrambler_setup.exe"
-
-                Write-Output "[KeyScrambler] NOTE: Auto-install requires manual download of KeyScrambler from QFX Software"
-                Write-Output "[KeyScrambler] Please download from: https://www.qfxsoftware.com/"
-                Write-Output "[KeyScrambler] Install to: $InstallPath"
-
-                $PlaceholderContent = @"
-@echo off
-echo KeyScrambler Placeholder
-echo This is a placeholder for the actual KeyScrambler executable
-echo Please install the real KeyScrambler from QFX Software
-pause
-"@
-                $PlaceholderContent | Out-File -FilePath $KeyScramblerExecutable -Encoding ASCII
-                Write-Output "[KeyScrambler] Created placeholder executable (replace with real KeyScrambler)"
-            }
-            catch {
-                Write-Output "[KeyScrambler] ERROR: Failed to setup KeyScrambler: $_"
-                return
-            }
-        }
-        else {
-            Write-Output "[KeyScrambler] Auto-install disabled - skipping installation"
-            return
-        }
-    }
-
-    try {
-        $ConfigContent = @"
-[Settings]
-AutoStart=1
-StartWithWindows=1
-EncryptClipboard=1
-EncryptAllApplications=1
-LogLevel=1
-UpdateCheck=1
-TrayIcon=1
-HotkeyEnabled=1
-Hotkey=Ctrl+Alt+K
-"@
-
-        $ConfigContent | Out-File -FilePath $KeyScramblerConfig -Encoding ASCII -Force
-        Write-Output "[KeyScrambler] Configuration updated"
-    }
-    catch {
-        Write-Output "[KeyScrambler] WARNING: Failed to create configuration: $_"
-    }
-
-    if (!$KeyScramblerRunning -and $AutoStart) {
-        try {
-            if (Test-Path $KeyScramblerExecutable) {
-                Start-Process -FilePath $KeyScramblerExecutable -WindowStyle Hidden -ErrorAction Stop
-                Write-Output "[KeyScrambler] Started KeyScrambler process"
-
-                Start-Sleep -Seconds 2
-                $VerifyProcess = Get-Process -Name "KeyScrambler" -ErrorAction SilentlyContinue
-                if ($VerifyProcess) {
-                    Write-Output "[KeyScrambler] KeyScrambler successfully started (PID: $($VerifyProcess.Id))"
-                }
-                else {
-                    Write-Output "[KeyScrambler] WARNING: KeyScrambler may not have started properly"
-                }
-            }
-            else {
-                Write-Output "[KeyScrambler] ERROR: KeyScrambler executable not found"
-            }
-        }
-        catch {
-            Write-Output "[KeyScrambler] ERROR: Failed to start KeyScrambler: $_"
-        }
-    }
-
-    try {
-        $StartupShortcut = Join-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup" "KeyScrambler.lnk"
-
-        if ($AutoStart) {
-            $Shell = New-Object -ComObject WScript.Shell
-            $Shortcut = $Shell.CreateShortcut($StartupShortcut)
-            $Shortcut.TargetPath = $KeyScramblerExecutable
-            $Shortcut.WorkingDirectory = $InstallPath
-            $Shortcut.WindowStyle = 1
-            $Shortcut.Save()
-
-            Write-Output "[KeyScrambler] Created startup shortcut for automatic launch"
-        }
-        else {
-            if (Test-Path $StartupShortcut) {
-                Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
-                Write-Output "[KeyScrambler] Removed startup shortcut"
-            }
-        }
-    }
-    catch {
-        Write-Output "[KeyScrambler] WARNING: Failed to manage startup shortcut: $_"
-    }
-
-    try {
-        $FirewallRule = Get-NetFirewallRule -DisplayName "KeyScrambler" -ErrorAction SilentlyContinue
-        if (!$FirewallRule) {
-            New-NetFirewallRule -DisplayName "KeyScrambler" -Direction Outbound -Program $KeyScramblerExecutable -Action Allow -Profile Any -Description "Allow KeyScrambler outbound connections" -ErrorAction SilentlyContinue
-            Write-Output "[KeyScrambler] Added firewall exception"
-        }
-    }
-    catch {
-        Write-Output "[KeyScrambler] WARNING: Failed to configure firewall: $_"
-    }
-
-    try {
-        $CurrentProcess = Get-Process -Name "KeyScrambler" -ErrorAction SilentlyContinue
-        if ($CurrentProcess) {
-            $MemoryUsage = [Math]::Round($CurrentProcess.WorkingSet64 / 1MB, 2)
-            $StartTime = $CurrentProcess.StartTime
-            $RunTime = (Get-Date) - $StartTime
-
-            Write-Output "[KeyScrambler] STATUS: Running | PID: $($CurrentProcess.Id) | Memory: ${MemoryUsage}MB | Runtime: $([Math]::Round($RunTime.TotalMinutes, 1))min"
-        }
-        else {
-            Write-Output "[KeyScrambler] STATUS: Not running"
-        }
-    }
-    catch {
-        Write-Output "[KeyScrambler] ERROR: Failed to get process status: $_"
-    }
-
-    try {
-        $Processes = Get-Process | Where-Object { $_.Modules -ne $null }
-        $KeyScramblerHooks = 0
-
-        foreach ($Process in $Processes) {
-            try {
-                $KeyScramblerDLLs = $Process.Modules | Where-Object { $_.ModuleName -match "kscramble|keyscram" }
-                if ($KeyScramblerDLLs) {
-                    $KeyScramblerHooks += $KeyScramblerDLLs.Count
-                }
-            }
-            catch {
-            }
-        }
-
-        if ($KeyScramblerHooks -gt 0) {
-            Write-Output "[KeyScrambler] ENCRYPTION: Active - $KeyScramblerHooks hooks detected"
-        }
-        else {
-            Write-Output "[KeyScrambler] ENCRYPTION: Not active or hooks not accessible"
-        }
-    }
-    catch {
-        Write-Output "[KeyScrambler] WARNING: Could not verify encryption status: $_"
-    }
-
-    Write-Output "[KeyScrambler] Management cycle completed"
 }
 
 function Invoke-YouTubeAdBlocker {
@@ -2052,10 +2165,34 @@ try {
     Install-Antivirus
     Initialize-Mutex
 
-    if (-not [System.Diagnostics.EventLog]::SourceExists($Config.EDRName)) {
-        New-EventLog -LogName Application -Source $Config.EDRName -ErrorAction SilentlyContinue
-    }
+    Register-TerminationProtection
 
+Write-Host "`n[PROTECTION] Initializing anti-termination safeguards..." -ForegroundColor Cyan
+
+if ($host.Name -eq "Windows PowerShell ISE Host") {
+    # In ISE, use trap handler which is already defined at the top
+    Write-Host "[PROTECTION] ISE detected - using trap-based Ctrl+C protection" -ForegroundColor Cyan
+    Write-Host "[PROTECTION] Ctrl+C protection enabled (requires $Script:MaxTerminationAttempts attempts to stop)" -ForegroundColor Green
+} else {
+    # In regular console, use the Console.CancelKeyPress handler
+    Enable-CtrlCProtection
+}
+
+
+# Enable auto-restart if running as admin
+try {
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($isAdmin) {
+        Enable-AutoRestart
+        Start-ProcessWatchdog
+    } else {
+        Write-Host "[INFO] Auto-restart requires administrator privileges (optional)" -ForegroundColor Gray
+    }
+} catch {
+    Write-Host "[WARNING] Some protection features failed to initialize: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Green
     Write-Host "[*] Starting detection jobs...`n" -ForegroundColor Cyan
 
     $loaded = 0
