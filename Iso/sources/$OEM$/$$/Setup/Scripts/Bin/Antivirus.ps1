@@ -153,6 +153,16 @@ function Reset-InternetProxySettings {
         }
     }
     catch {}
+
+    # Remove hosts file entries
+    try {
+        $hostsPath = "C:\Windows\System32\drivers\etc\hosts"
+        $hostsContent = Get-Content $hostsPath
+        $cleanContent = $hostsContent | Where-Object { $_ -notmatch "# Ad Blocking" -and $_ -notmatch "127\.0\.0\.1.*ads?" -and $_ -notmatch "127\.0\.0\.1.*doubleclick" -and $_ -notmatch "127\.0\.0\.1.*googleads" }
+        Set-Content $hostsPath $cleanContent -Encoding UTF8
+        ipconfig /flushdns | Out-Null
+    }
+    catch {}
 }
 
 function Register-ExitCleanup {
@@ -1924,6 +1934,64 @@ public class KeyScrambler
     }
 }
 
+function Set-HostsFileBlock {
+    param(
+        [string[]]$Domains,
+        [string]$RedirectIP = "127.0.0.1"
+    )
+    
+    try {
+        $hostsPath = "C:\Windows\System32\drivers\etc\hosts"
+        $hostsContent = Get-Content $hostsPath -ErrorAction SilentlyContinue
+        
+        # Check if ad blocking section already exists
+        if ($hostsContent -match "# Ad Blocking") {
+            Write-Host "Hosts file already contains ad blocking entries"
+            return
+        }
+        
+        # Add ad blocking entries
+        $adEntries = @(
+            "",
+            "# Ad Blocking - Redirect ad domains to localhost",
+            "$RedirectIP`t$pagead2.googlesyndication.com",
+            "$RedirectIP`tgooglesyndication.com",
+            "$RedirectIP`tgoogleadservices.com",
+            "$RedirectIP`tads.google.com",
+            "$RedirectIP`tdoubleclick.net",
+            "$RedirectIP`twww.googleadservices.com",
+            "$RedirectIP`twww.googlesyndication.com",
+            "$RedirectIP`tgoogle-analytics.com",
+            "$RedirectIP`tssl.google-analytics.com",
+            "$RedirectIP`twww.google-analytics.com",
+            "$RedirectIP`tfacebook.com/tr",
+            "$RedirectIP`tconnect.facebook.net",
+            "$RedirectIP`tads.facebook.com",
+            "$RedirectIP`tamazon-adsystem.com",
+            "$RedirectIP`tads.yahoo.com",
+            "$RedirectIP`tadvertising.amazon.com",
+            "$RedirectIP`ttaboola.com",
+            "$RedirectIP`toutbrain.com",
+            "$RedirectIP`tscorecardresearch.com",
+            "$RedirectIP`tquantserve.com",
+            "$RedirectIP`tads-twitter.com",
+            "$RedirectIP`tanalytics.twitter.com",
+            "$RedirectIP`tads.linkedin.com",
+            "$RedirectIP`tanalytics.linkedin.com",
+            "$RedirectIP`tads.reddit.com",
+            "$RedirectIP`tads.tiktok.com",
+            "$RedirectIP`tanalytics.tiktok.com"
+        )
+        
+        Add-Content $hostsPath $adEntries -Encoding UTF8
+        ipconfig /flushdns | Out-Null
+        Write-Host "Added ad blocking entries to hosts file"
+        
+    } catch {
+        Write-Host "Error updating hosts file: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-YouTubeAdBlocker {
     [CmdletBinding()]
     param()
@@ -1932,22 +2000,27 @@ function Invoke-YouTubeAdBlocker {
     $results = @()
 
     try {
+        # First, set up hosts file blocking
+        Set-HostsFileBlock
+        $results += "[YouTubeAdBlocker] Hosts file configured for ad blocking"
+
+        # Check if proxy is already running
         $existingJob = Get-Job -Name "YouTubeAdBlockerProxy" -ErrorAction SilentlyContinue
 
         if ($existingJob -and $existingJob.State -eq 'Running') {
-            $results += "[YouTubeAdBlocker] Proxy server running on port $Port"
-            return $results
-        }
+            $results += "[YouTubeAdBlocker] YouTube proxy already running on port $Port"
+        } else {
+            # Clean up existing job
+            Get-Job -Name "YouTubeAdBlockerProxy" -ErrorAction SilentlyContinue | Remove-Job -Force
 
-        Get-Job -Name "YouTubeAdBlockerProxy" -ErrorAction SilentlyContinue | Remove-Job -Force
+            # Start YouTube proxy
+            $proxyJob = Start-Job -Name "YouTubeAdBlockerProxy" -ScriptBlock {
+                param($Port)
 
-        $proxyJob = Start-Job -Name "YouTubeAdBlockerProxy" -ScriptBlock {
-            param($Port)
+                $ErrorActionPreference = "Continue"
 
-            $ErrorActionPreference = "Continue"
-
-            # YouTube-specific JavaScript injection
-            $YouTubeScriptlet = @"
+                # YouTube-specific JavaScript injection
+                $YouTubeScriptlet = @"
 <script>
 (function() {
     'use strict';
@@ -1976,317 +2049,122 @@ function Invoke-YouTubeAdBlocker {
 </script>
 "@
 
-            function Inject-YouTubeScript {
-                param([string]$HtmlContent)
-                if ($HtmlContent -match '</head>') {
-                    return $HtmlContent -replace '</head>', "$YouTubeScriptlet</head>"
-                } elseif ($HtmlContent -match '<body[^>]*>') {
-                    return $HtmlContent -replace '(<body[^>]*>)', "`$1$YouTubeScriptlet"
+                function Inject-YouTubeScript {
+                    param([string]$HtmlContent)
+                    if ($HtmlContent -match '</head>') {
+                        return $HtmlContent -replace '</head>', "$YouTubeScriptlet</head>"
+                    } elseif ($HtmlContent -match '<body[^>]*>') {
+                        return $HtmlContent -replace '(<body[^>]*>)', "`$1$YouTubeScriptlet"
+                    }
+                    return $HtmlContent
                 }
-                return $HtmlContent
-            }
 
-            function Handle-Request {
-                param($Context)
-                $request = $Context.Request
-                $response = $Context.Response
+                function Handle-Request {
+                    param($Context)
+                    $request = $Context.Request
+                    $response = $Context.Response
+
+                    try {
+                        $method = $request.HttpMethod
+                        $requestUrl = $request.RawUrl
+                        $hostHeader = $request.Headers['Host']
+
+                        # Only handle YouTube domains
+                        if ($hostHeader -and ($hostHeader -like '*youtube*' -or $hostHeader -like '*youtu.be*')) {
+                            $targetUrl = "https://$hostHeader$requestUrl"
+
+                            $webRequest = [System.Net.HttpWebRequest]::Create($targetUrl)
+                            $webRequest.Method = $method
+                            $webRequest.UserAgent = $request.UserAgent
+                            $webRequest.Timeout = 30000
+
+                            foreach ($header in $request.Headers.AllKeys) {
+                                if ($header -notin @('Host', 'Connection', 'Proxy-Connection', 'Content-Length')) {
+                                    try { $webRequest.Headers.Add($header, $request.Headers[$header]) } catch {}
+                                }
+                            }
+
+                            if ($method -in @('POST', 'PUT', 'PATCH') -and $request.HasEntityBody) {
+                                $webRequest.ContentLength = $request.ContentLength64
+                                $webRequest.ContentType = $request.ContentType
+                                $requestStream = $webRequest.GetRequestStream()
+                                $request.InputStream.CopyTo($requestStream)
+                                $requestStream.Close()
+                            }
+
+                            try {
+                                $webResponse = $webRequest.GetResponse()
+                            } catch [System.Net.WebException] {
+                                $webResponse = $_.Exception.Response
+                                if ($null -eq $webResponse) { throw }
+                            }
+
+                            $response.StatusCode = [int]$webResponse.StatusCode
+                            $response.StatusDescription = $webResponse.StatusDescription
+
+                            foreach ($header in $webResponse.Headers.AllKeys) {
+                                if ($header -notin @('Transfer-Encoding', 'Content-Length')) {
+                                    try { $response.Headers.Add($header, $webResponse.Headers[$header]) } catch {}
+                                }
+                            }
+
+                            $responseStream = $webResponse.GetResponseStream()
+                            $reader = New-Object System.IO.StreamReader($responseStream)
+                            $content = $reader.ReadToEnd()
+                            $reader.Close()
+                            $responseStream.Close()
+                            $webResponse.Close()
+
+                            if ($webResponse.ContentType -like "*text/html*") {
+                                $content = Inject-YouTubeScript -HtmlContent $content
+                            }
+
+                            $buffer = [System.Text.Encoding]::UTF8.GetBytes($content)
+                            $response.ContentLength64 = $buffer.Length
+                            $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                            $response.Close()
+
+                        } else {
+                            # For non-YouTube requests, return error to force direct connection
+                            $response.StatusCode = 502
+                            $response.Close()
+                        }
+
+                    } catch {
+                        try {
+                            $response.StatusCode = 502
+                            $response.Close()
+                        } catch {}
+                    }
+                }
+
+                $listener = New-Object System.Net.HttpListener
+                $listener.Prefixes.Add("http://localhost:$Port/")
 
                 try {
-                    $method = $request.HttpMethod
-                    $requestUrl = $request.RawUrl
-
-                    if ($method -eq "CONNECT") {
-                        $response.StatusCode = 501
-                        $response.Close()
-                        return
+                    $listener.Start()
+                    while ($listener.IsListening) {
+                        $context = $listener.GetContext()
+                        Handle-Request -Context $context
                     }
-
-                    $targetUrl = if ($requestUrl -match '^http') { $requestUrl } else { "http://$($request.Headers['Host'])$requestUrl" }
-
-                    $webRequest = [System.Net.HttpWebRequest]::Create($targetUrl)
-                    $webRequest.Method = $method
-                    $webRequest.UserAgent = $request.UserAgent
-                    $webRequest.Timeout = 30000
-
-                    foreach ($header in $request.Headers.AllKeys) {
-                        if ($header -notin @('Host', 'Connection', 'Proxy-Connection', 'Content-Length')) {
-                            try { $webRequest.Headers.Add($header, $request.Headers[$header]) } catch {}
-                        }
-                    }
-
-                    if ($method -in @('POST', 'PUT', 'PATCH') -and $request.HasEntityBody) {
-                        $webRequest.ContentLength = $request.ContentLength64
-                        $webRequest.ContentType = $request.ContentType
-                        $requestStream = $webRequest.GetRequestStream()
-                        $request.InputStream.CopyTo($requestStream)
-                        $requestStream.Close()
-                    }
-
-                    try {
-                        $webResponse = $webRequest.GetResponse()
-                    } catch [System.Net.WebException] {
-                        $webResponse = $_.Exception.Response
-                        if ($null -eq $webResponse) { throw }
-                    }
-
-                    $response.StatusCode = [int]$webResponse.StatusCode
-                    $response.StatusDescription = $webResponse.StatusDescription
-
-                    foreach ($header in $webResponse.Headers.AllKeys) {
-                        if ($header -notin @('Transfer-Encoding', 'Content-Length')) {
-                            try { $response.Headers.Add($header, $webResponse.Headers[$header]) } catch {}
-                        }
-                    }
-
-                    $responseStream = $webResponse.GetResponseStream()
-                    $reader = New-Object System.IO.StreamReader($responseStream)
-                    $content = $reader.ReadToEnd()
-                    $reader.Close()
-                    $responseStream.Close()
-                    $webResponse.Close()
-
-                    if ($webResponse.ContentType -like "*text/html*") {
-                        $content = Inject-YouTubeScript -HtmlContent $content
-                    }
-
-                    $buffer = [System.Text.Encoding]::UTF8.GetBytes($content)
-                    $response.ContentLength64 = $buffer.Length
-                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
-                    $response.Close()
-
                 } catch {
-                    try {
-                        $response.StatusCode = 502
-                        $response.Close()
-                    } catch {}
+                } finally {
+                    if ($listener.IsListening) { $listener.Stop() }
+                    $listener.Close()
                 }
-            }
+            } -ArgumentList $Port
 
-            $listener = New-Object System.Net.HttpListener
-            $listener.Prefixes.Add("http://localhost:$Port/")
-            $listener.Prefixes.Add("http://127.0.0.1:$Port/")
+            Start-Sleep -Milliseconds 500
+            $results += "[YouTubeAdBlocker] YouTube proxy started on port $Port"
+        }
 
-            try {
-                $listener.Start()
-                while ($listener.IsListening) {
-                    $context = $listener.GetContext()
-                    Handle-Request -Context $context
-                }
-            } catch {
-            } finally {
-                if ($listener.IsListening) { $listener.Stop() }
-                $listener.Close()
-            }
-        } -ArgumentList $Port
-
-        Start-Sleep -Milliseconds 500
-
+        # Create simplified PAC file
         $pacFile = "$env:TEMP\youtube-adblocker.pac"
-        $pacContent = @"
-// Comprehensive Ad-Blocking with YouTube JS Injection Proxy
-// Based on BlockAds.txt with YouTube-specific routing
-
-// Configuration Variables
-var normal = "DIRECT";
-var blackhole = "PROXY 127.0.0.1:3421";  // Ad-blocking blackhole proxy
-var youtubeProxy = "PROXY 127.0.0.1:8080";  // YouTube JS injection proxy
-var isEnabled = 1;
-var debug = 0;
-
-// Whitelist: Domains explicitly allowed
-var whitelist = [
-    "twitter.com",
-    "x.com",
-    "perplexity.ai",
-    "mediafire.com",
-    "apple.com",
-    "schooner.com",
-    "citibank.com",
-    "ebay.com",
-    "yahoo.com",
-    "discord.com",
-    "click.discord.com",
-    "discordapp.com",
-    "cdn.discordapp.com",
-    "cdn.discord.app",
-    "discord.gg",
-    "discord.media",
-    "discordapp.net",
-    "media.discordapp.net",
-    "discordstatus.com",
-    "dis.gd",
-    "discordcdn.com",
-    "aliexpress.com",
-    "tenor.com",
-    "media.tenor.com"
-];
-
-// Comprehensive Regular Expression for Ad/Tracking Domains and Subdomains
-var adDomainRegex = /^(?:.*[-_.])?(ads?|adv(ert(s|ising)?)?|banners?|track(er|ing|s)?|beacons?|doubleclick|adservice|adnxs|adtech|googleads|gads|adwords|partner|sponsor(ed)?|click(s|bank|tale|through)?|pop(up|under)s?|promo(tion)?|market(ing|er)?|affiliates?|metrics?|stat(s|counter|istics)?|analytics?|pixel(s)?|campaign|traff(ic|iq)|monetize|syndicat(e|ion)|revenue|yield|impress(ion)?s?|conver(sion|t)?|audience|target(ing)?|behavior|profil(e|ing)|telemetry|survey|poll|outbrain|taboola|quantcast|scorecard|omniture|comscore|krux|bluekai|exelate|adform|adroll|rubicon|vungle|inmobi|flurry|mixpanel|heap|amplitude|optimizely|bizible|pardot|hubspot|marketo|eloqua|salesforce|media(math|net)|criteo|appnexus|turn|adbrite|admob|adsonar|adscale|zergnet|revcontent|mgid|nativeads|contentad|displayads|bannerflow|adblade|adcolony|chartbeat|newrelic|pingdom|gauges|kissmetrics|webtrends|tradedesk|bidder|auction|rtb|programmatic|splash|interstitial|overlay)\./i;
-
-// Regular Expression for Ad-Related URL Patterns and XSS Blocking
-var adUrlRegex = /(?:\/(?:adcontent|img\/adv|web\-ad|iframead|contentad|ad\/image|video\-ad|stats\/event|xtclicks|adscript|bannerad|googlead|adhandler|adimages|embed\-log|adconfig|tracking\/track|tracker\/track|adrequest|nativead|adman|advertisement|adframe|adcontrol|adoverlay|adserver|adsense|google\-ads|ad\-banner|banner\-ad|campaign\/advertiser|adplacement|adblockdetect|advertising|admanagement|adprovider|adrotation|adtop|adbottom|adleft|adright|admiddle|adlarge|adsmall|admicro|adunit|adcall|adlog|adcount|adserve|adsrv|adsys|adtrack|adview|adwidget|adzone|banner\/adv|google_tag|image\/ads|sidebar\-ads|footer\-ads|top\-ads|bottom\-ads|new\-ads|search\-ads|lazy\-ads|responsive\-ads|dynamic\/ads|external\/ads|mobile\-ads|house\-ads|blog\/ads|online\/ads|pc\/ads|left\-ads|right\-ads|ads\/square|ads\/text|ads\/html|ads\/js|ads\.php|ad\.js|ad\.css|\?affiliate=|\?advertiser=|\&adspace=|\&adserver=|\&adgroupid=|\&adpageurl=|\.adserve|\.ads\d|\.adspace|\.adsense|\.adserver|\.google\-ads|\.banner\-ad|\.ad\-banner|\.adplacement|\.advertising|\.admanagement|\.adprovider|\.adrotation|\.adtop|\.adbottom|\.adleft|\.adright|\.admiddle|\.adlarge|\.adsmall|\.admicro|\.adunit|\.adcall|\.adlog|\.adcount|\.adserve|\.adsrv|\.adsys|\.adtrack|\.adview|\.adwidget|\.adzone|xss))/i;
-
-// Regular Expression for Common Ad Subdomains
-var adSubdomainRegex = /^(?:adcreative(s)?|imageserv|media(mgr)?|stats|switch|track(2|er)?|view|ad(s)?\d{0,3}|banner(s)?\d{0,3}|click(s)?\d{0,3}|count(er)?\d{0,3}|servedby\d{0,3}|toolbar\d{0,3}|pageads\d{0,3}|pops\d{0,3}|promos\d{0,3})\./i;
-
-// Regular Expression for Web Bugs and Flash Ads
-var adWebBugRegex = /(?:\/(?:1|blank|b|clear|pixel|transp|spacer)\.gif|\.swf)$/i;
-
-// Blacklist: Explicitly blocked domains
-var blacklist = [
-    "adtago.s3.amazonaws.com",
-    "analyticsengine.s3.amazonaws.com",
-    "advice-ads.s3.amazonaws.com",
-    "affiliationjs.s3.amazonaws.com",
-    "advertising-api-eu.amazon.com",
-    "ssl.google-analytics.com",
-    "fastclick.com",
-    "fastclick.net",
-    "media.fastclick.net",
-    "cdn.fastclick.net",
-    "analytics.yahoo.com",
-    "global.adserver.yahoo.com",
-    "ads.yap.yahoo.com",
-    "appmetrica.yandex.com",
-    "yandexadexchange.net",
-    "analytics.mobile.yandex.net",
-    "extmaps-api.yandex.net",
-    "adsdk.yandex.ru",
-    "hotjar.com",
-    "static.hotjar.com",
-    "api-hotjar.com",
-    "jotjar-analytics.com",
-    "mouseflow.com",
-    "freshmarketer.com",
-    "luckyorange.com",
-    "cdn.luckyorange.com",
-    "w1.luckyorange.com",
-    "upload.luckyorange.com",
-    "cs.luckyorange.com",
-    "settings.luckyorange.com",
-    "stats.wp.com",
-    "app.bugsnag.com",
-    "api.bugsnag.com",
-    "notify.bugsnag.com",
-    "sessions.bugsnag.com",
-    "browser.sentry-cdn.com",
-    "app.getsentry.com",
-    "amazonaws.com",
-    "amazonaax.com",
-    "amazonclix.com",
-    "assoc-amazon.com",
-    "ads.google.com",
-    "pagead2.googlesyndication.com",
-    "pagead2.googleadservices.com",
-    "amazon-adsystem.com",
-    "googleadservices.com",
-    "doubleclick.net",
-    "ad.doubleclick.net",
-    "static.doubleclick.net",
-    "m.doubleclick.net",
-    "mediavisor.doubleclick.net",
-    "googleads.g.doubleclick.net",
-    "adclick.g.doubleclick.net",
-    "carbonads.net",
-    "advertising.amazon.com",
-    "advertising.amazon.ca",
-    "google-analytics.com",
-    "doubleclick.com",
-    "doubleclick.de",
-    "partner.googleadservices.com",
-    "googlesyndication.com",
-    "zedo.com",
-    "amazon.ae",
-    "amazon.cn",
-    "advertising.amazon.co.jp",
-    "amazon.co.uk",
-    "advertising.amazon.com.au",
-    "advertising.amazon.com.mx",
-    "advertising.amazon.de",
-    "advertising.amazon.es",
-    "advertising.amazon.fr",
-    "advertising.amazon.in",
-    "advertising.amazon.it",
-    "advertising.amazon.sa",
-    "bingads.microsoft.com",
-    "adcash.com",
-    "taboola.com",
-    "outbrain.com",
-    "smartyads.com",
-    "popads.net",
-    "adpushup.com",
-    "trafficforce.com",
-    "adsterra.com",
-    "creative.ak.fbcdn.net",
-    "adbrite.com",
-    "exponential.com",
-    "quantserve.com",
-    "scorecardresearch.com",
-    "propellerads.com",
-    "admedia.net",
-    "admedia.com",
-    "bidvertiser.com",
-    "undertone.com",
-    "web.adblade.com",
-    "revenuehits.com",
-    "infolinks.com",
-    "vibrantmedia.com",
-    "ads.yahoosmallbusiness.com",
-    "ads.yahoo.com",
-    "hilltopads.net",
-    "clickadu.com",
-    "citysex.com",
-    "ad-maven.com",
-    "propelmedia.com",
-    "enginemediaexchange.com",
-    "advertisers.adversense.com",
-    "a.adtng.com",
-    "ads.facebook.com",
-    "an.facebook.com",
-    "analytics.facebook.com",
-    "pixel.facebook.com",
-    "ads.youtube.com",
-    "youtube.cleverads.vn",
-    "ads-twitter.com",
-    "ads-api.twitter.com",
-    "advertising.twitter.com",
-    "ads.linkedin.com",
-    "analytics.pointdrive.linkedin.com",
-    "ads.reddit.com",
-    "d.reddit.com",
-    "rereddit.com",
-    "events.redditmedia.com",
-    "analytics.tiktok.com",
-    "ads.tiktok.com",
-    "analytics-sg.tiktok.com",
-    "ads-sg.tiktok.com"
-];
-
-// Main Proxy Auto-Configuration Function
+        $pacContent = @'
 function FindProxyForURL(url, host) {
     host = host.toLowerCase();
     url = url.toLowerCase();
-
-    if (debug) {
-        alert("Checking...\nURL: " + url + "\nHost: " + host);
-    }
-
-    // Toggle ad-blocking on/off via special URLs
-    if (host === "antiad.on") {
-        isEnabled = 1;
-        if (debug) alert("Ad-blocking enabled");
-        return blackhole;
-    } else if (host === "antiad.off") {
-        isEnabled = 0;
-        if (debug) alert("Ad-blocking disabled");
-        return blackhole;
-    }
-
-    if (!isEnabled) {
-        return normal;
-    }
-
+    
     // Local network bypass
     if (isPlainHostName(host) ||
         shExpMatch(host, "10.*") ||
@@ -2294,53 +2172,45 @@ function FindProxyForURL(url, host) {
         shExpMatch(host, "192.168.*") ||
         shExpMatch(host, "127.*") ||
         dnsDomainIs(host, ".local")) {
-        return normal;
+        return "DIRECT";
     }
-
-    // YouTube routing: Send to JS injection proxy FIRST (before ad checks)
+    
+    // Route YouTube through JS injection proxy
     if (shExpMatch(host, "*.youtube.com") ||
         shExpMatch(host, "*.youtu.be") ||
         host === "youtube.com" ||
         host === "youtu.be") {
-        if (debug) alert("YouTube traffic routed to JS injection proxy");
-        return youtubeProxy;
+        return "PROXY 127.0.0.1:8080";
     }
-
-    // Whitelist check
+    
+    // Whitelist important domains
+    var whitelist = [
+        "twitter.com", "x.com", "perplexity.ai", "mediafire.com",
+        "apple.com", "citibank.com", "ebay.com", "yahoo.com",
+        "discord.com", "discordapp.com", "cdn.discordapp.com",
+        "discord.gg", "discordcdn.com", "aliexpress.com",
+        "tenor.com", "media.tenor.com"
+    ];
+    
     for (var i = 0; i < whitelist.length; i++) {
-        if (shExpMatch(host, whitelist[i])) {
-            if (debug) alert("Whitelisted: " + host);
-            return normal;
+        if (shExpMatch(host, whitelist[i]) || dnsDomainIs(host, whitelist[i])) {
+            return "DIRECT";
         }
     }
-
-    // Ad-blocking logic for all other traffic
-    if (
-        adDomainRegex.test(host) ||
-        adUrlRegex.test(url) ||
-        adSubdomainRegex.test(host) ||
-        adWebBugRegex.test(url) ||
-        blacklist.indexOf(host) !== -1
-    ) {
-        if (debug) alert("Blocked...\nURL: " + url + "\nHost: " + host);
-        return blackhole;
-    }
-
-    if (debug) alert("Not Blocked...\nURL: " + url + "\nHost: " + host);
-    return normal;
+    
+    // Everything else uses hosts file blocking (DIRECT)
+    return "DIRECT";
 }
-
-if (debug) {
-    alert("Ad-blocking PAC file with YouTube JS injection loaded, isEnabled = " + isEnabled);
-}
-"@
+'@
 
         Set-Content -Path $pacFile -Value $pacContent -Encoding ASCII -ErrorAction Stop
 
+        # Configure system to use PAC file
         $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
         Set-ItemProperty -Path $regPath -Name AutoConfigURL -Value "file:///$($pacFile -replace '\\','/')" -ErrorAction Stop
         Set-ItemProperty -Path $regPath -Name ProxyEnable -Value 0 -ErrorAction Stop
 
+        # Refresh proxy settings
         try {
             $signature = @'
 [DllImport("wininet.dll", SetLastError = true, CharSet=CharSet.Auto)]
@@ -2351,10 +2221,10 @@ public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntP
             $wininet::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
         } catch {}
 
-        $results += "[YouTubeAdBlocker] Proxy server started on port $Port"
-        $results += "[YouTubeAdBlocker] PAC file configured with comprehensive ad-blocking"
+        $results += "[YouTubeAdBlocker] PAC file configured for hybrid blocking"
         $results += "[YouTubeAdBlocker] YouTube traffic: JS injection proxy (port 8080)"
-        $results += "[YouTubeAdBlocker] All other ads: Blackhole proxy (port 3421)"
+        $results += "[YouTubeAdBlocker] Other ads: Hosts file blocking"
+        $results += "[YouTubeAdBlocker] Restart browser for full effect"
 
     } catch {
         $results += "[YouTubeAdBlocker] ERROR: $($_.Exception.Message)"
