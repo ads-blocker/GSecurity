@@ -45,6 +45,7 @@ $Script:ManagedJobConfig = @{
     DNSExfiltrationDetectionIntervalSeconds = 30
     PasswordManagementIntervalSeconds = 120
     YouTubeAdBlockerIntervalSeconds = 300
+    WebcamGuardianIntervalSeconds = 5
 }
 
 $Config = @{
@@ -1594,6 +1595,206 @@ function Invoke-PasswordManagement {
         Write-Output "[Password] Running with Administrator privileges"
     }
 
+function Invoke-WebcamGuardian {
+    <#
+    .SYNOPSIS
+    Monitors and controls webcam access with explicit user permission.
+    
+    .DESCRIPTION
+    Keeps webcam disabled by default. When any application tries to access it,
+    shows a permission popup. Only enables webcam after explicit user approval.
+    Automatically disables webcam when application closes.
+    
+    .PARAMETER LogPath
+    Path to store webcam access logs
+    #>
+    param(
+        [string]$LogPath
+    )
+    
+    # Initialize static variables
+    if (-not $script:WebcamGuardianState) {
+        $script:WebcamGuardianState = @{
+            Initialized = $false
+            WebcamDevices = @()
+            CurrentlyAllowedProcesses = @{}
+            LastCheck = [DateTime]::MinValue
+            AccessLog = if ($LogPath) { Join-Path $LogPath "webcam_access.log" } else { "$env:TEMP\webcam_access.log" }
+        }
+    }
+    
+    # Initialize webcam devices list (only once)
+    if (-not $script:WebcamGuardianState.Initialized) {
+        try {
+            # Find all imaging devices (webcams)
+            $script:WebcamGuardianState.WebcamDevices = Get-PnpDevice -Class "Camera","Image" -Status "OK" -ErrorAction SilentlyContinue
+            
+            if ($script:WebcamGuardianState.WebcamDevices.Count -eq 0) {
+                # Try alternative method
+                $script:WebcamGuardianState.WebcamDevices = Get-PnpDevice | Where-Object {
+                    $_.Class -match "Camera|Image" -or 
+                    $_.FriendlyName -match "Camera|Webcam|Video"
+                } -ErrorAction SilentlyContinue
+            }
+            
+            if ($script:WebcamGuardianState.WebcamDevices.Count -gt 0) {
+                Write-AVLog "[WebcamGuardian] Found $($script:WebcamGuardianState.WebcamDevices.Count) webcam device(s)" "INFO"
+                
+                # Disable all webcams by default
+                foreach ($device in $script:WebcamGuardianState.WebcamDevices) {
+                    try {
+                        Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                        Write-AVLog "[WebcamGuardian] Disabled webcam: $($device.FriendlyName)" "INFO"
+                    }
+                    catch {
+                        Write-AVLog "[WebcamGuardian] Could not disable $($device.FriendlyName): $($_.Exception.Message)" "WARN"
+                    }
+                }
+                
+                $script:WebcamGuardianState.Initialized = $true
+                Write-Host "[WebcamGuardian] Protection initialized - webcam disabled by default" -ForegroundColor Green
+            }
+            else {
+                Write-AVLog "[WebcamGuardian] No webcam devices found" "INFO"
+                $script:WebcamGuardianState.Initialized = $true
+                return
+            }
+        }
+        catch {
+            Write-AVLog "[WebcamGuardian] Initialization error: $($_.Exception.Message)" "ERROR"
+            return
+        }
+    }
+    
+    # Skip check if no webcam devices
+    if ($script:WebcamGuardianState.WebcamDevices.Count -eq 0) {
+        return
+    }
+    
+    # Monitor for processes trying to access webcam
+    try {
+        # Get all processes that might access camera
+        $cameraProcesses = Get-Process | Where-Object {
+            $_.ProcessName -match "chrome|firefox|edge|msedge|teams|zoom|skype|obs|discord|slack" -or
+            $_.MainWindowTitle -ne ""
+        } | Select-Object Id, ProcessName, Path, MainWindowTitle
+        
+        foreach ($proc in $cameraProcesses) {
+            # Skip if already allowed
+            if ($script:WebcamGuardianState.CurrentlyAllowedProcesses.ContainsKey($proc.Id)) {
+                # Check if process still exists
+                if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) {
+                    # Process closed - remove from allowed list and disable webcam
+                    $script:WebcamGuardianState.CurrentlyAllowedProcesses.Remove($proc.Id)
+                    
+                    # Disable webcam if no other processes are using it
+                    if ($script:WebcamGuardianState.CurrentlyAllowedProcesses.Count -eq 0) {
+                        foreach ($device in $script:WebcamGuardianState.WebcamDevices) {
+                            Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                        }
+                        $logEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [AUTO-DISABLE] Process closed - webcam disabled"
+                        Add-Content -Path $script:WebcamGuardianState.AccessLog -Value $logEntry -ErrorAction SilentlyContinue
+                        Write-AVLog "[WebcamGuardian] All processes closed - webcam disabled" "INFO"
+                    }
+                }
+                continue
+            }
+            
+            # Check if process is trying to access webcam (heuristic check)
+            $isAccessingCamera = $false
+            
+            try {
+                # Check if process has handles to camera devices
+                $handles = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue | 
+                    Select-Object -ExpandProperty Modules -ErrorAction SilentlyContinue |
+                    Where-Object { $_.ModuleName -match "mf|avicap|video|camera" }
+                
+                if ($handles) {
+                    $isAccessingCamera = $true
+                }
+            }
+            catch {}
+            
+            # If camera access detected, show permission dialog
+            if ($isAccessingCamera) {
+                $procName = if ($proc.Path) { Split-Path -Leaf $proc.Path } else { $proc.ProcessName }
+                $windowTitle = if ($proc.MainWindowTitle) { $proc.MainWindowTitle } else { "Unknown Window" }
+                
+                # Create permission dialog
+                Add-Type -AssemblyName System.Windows.Forms
+                $result = [System.Windows.Forms.MessageBox]::Show(
+                    "Application '$procName' is trying to access your webcam.`n`nWindow: $windowTitle`nPID: $($proc.Id)`n`nAllow webcam access?",
+                    "Webcam Permission Request",
+                    [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning,
+                    [System.Windows.Forms.MessageBoxDefaultButton]::Button2
+                )
+                
+                $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+                
+                if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    # User allowed - enable webcam
+                    foreach ($device in $script:WebcamGuardianState.WebcamDevices) {
+                        Enable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    }
+                    
+                    $script:WebcamGuardianState.CurrentlyAllowedProcesses[$proc.Id] = @{
+                        ProcessName = $procName
+                        WindowTitle = $windowTitle
+                        AllowedAt = Get-Date
+                    }
+                    
+                    $logEntry = "[$timestamp] [ALLOWED] $procName (PID: $($proc.Id)) | Window: $windowTitle"
+                    Add-Content -Path $script:WebcamGuardianState.AccessLog -Value $logEntry -ErrorAction SilentlyContinue
+                    Write-AVLog "[WebcamGuardian] Access ALLOWED: $procName (PID: $($proc.Id))" "INFO"
+                    Write-Host "[WebcamGuardian] Webcam access ALLOWED for $procName" -ForegroundColor Green
+                }
+                else {
+                    # User denied - keep webcam disabled and log
+                    $logEntry = "[$timestamp] [DENIED] $procName (PID: $($proc.Id)) | Window: $windowTitle"
+                    Add-Content -Path $script:WebcamGuardianState.AccessLog -Value $logEntry -ErrorAction SilentlyContinue
+                    Write-AVLog "[WebcamGuardian] Access DENIED: $procName (PID: $($proc.Id))" "WARN"
+                    Write-Host "[WebcamGuardian] Webcam access DENIED for $procName" -ForegroundColor Red
+                    
+                    # Optionally terminate the process trying to access webcam
+                    # Uncomment the next line if you want to kill processes that are denied
+                    # Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        
+        # Clean up dead processes from allowed list
+        $deadProcesses = @()
+        foreach ($pid in $script:WebcamGuardianState.CurrentlyAllowedProcesses.Keys) {
+            if (-not (Get-Process -Id $pid -ErrorAction SilentlyContinue)) {
+                $deadProcesses += $pid
+            }
+        }
+        
+        foreach ($pid in $deadProcesses) {
+            $script:WebcamGuardianState.CurrentlyAllowedProcesses.Remove($pid)
+        }
+        
+        # Disable webcam if no processes are allowed
+        if ($script:WebcamGuardianState.CurrentlyAllowedProcesses.Count -eq 0) {
+            $now = Get-Date
+            # Only disable every 30 seconds to avoid excessive device operations
+            if (($now - $script:WebcamGuardianState.LastCheck).TotalSeconds -ge 30) {
+                foreach ($device in $script:WebcamGuardianState.WebcamDevices) {
+                    $status = Get-PnpDevice -InstanceId $device.InstanceId -ErrorAction SilentlyContinue
+                    if ($status -and $status.Status -eq "OK") {
+                        Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    }
+                }
+                $script:WebcamGuardianState.LastCheck = $now
+            }
+        }
+    }
+    catch {
+        Write-AVLog "[WebcamGuardian] Monitoring error: $($_.Exception.Message)" "ERROR"
+    }
+}
+
     function Test-PasswordSecurity {
         try {
             $CurrentUser = Get-LocalUser -Name $env:USERNAME -ErrorAction SilentlyContinue
@@ -1992,248 +2193,326 @@ function Set-HostsFileBlock {
     }
 }
 
-function Invoke-YouTubeAdBlocker {
-    [CmdletBinding()]
-    param()
+function Install-TampermonkeyViaRegistry {
+    <#
+    .SYNOPSIS
+    Installs Tampermonkey browser extension via Group Policy registry entries
+    #>
+    
+    Write-Host "[YouTube Ad Blocker] Installing Tampermonkey via registry policy..." -ForegroundColor Cyan
+    
+    # Tampermonkey Extension IDs
+    $tampermonkeyChrome = "dhdgffkkebhmkfjojejmpbldmpobfkfo"
+    $tampermonkeyUpdateURL = "https://clients2.google.com/service/update2/crx"
+    
+    # Chromium-based browsers (Chrome, Brave, Edge, Arc, Vivaldi)
+    $chromiumBrowsers = @(
+        @{Name="Google\Chrome"; Path="HKLM:\Software\Policies\Google\Chrome"},
+        @{Name="BraveSoftware\Brave"; Path="HKLM:\Software\Policies\BraveSoftware\Brave"},
+        @{Name="Microsoft\Edge"; Path="HKLM:\Software\Policies\Microsoft\Edge"},
+        @{Name="The Browser Company\Arc"; Path="HKLM:\Software\Policies\The Browser Company\Arc"},
+        @{Name="Vivaldi"; Path="HKLM:\Software\Policies\Vivaldi"}
+    )
+    
+    foreach ($browser in $chromiumBrowsers) {
+        try {
+            # Ensure base policy key exists
+            if (-not (Test-Path $browser.Path)) {
+                New-Item -Path $browser.Path -Force | Out-Null
+            }
+            
+            # Ensure ExtensionInstallForcelist key exists
+            $forcelistPath = "$($browser.Path)\ExtensionInstallForcelist"
+            if (-not (Test-Path $forcelistPath)) {
+                New-Item -Path $forcelistPath -Force | Out-Null
+            }
+            
+            # Find next available number for the extension
+            $existingEntries = Get-ItemProperty -Path $forcelistPath -ErrorAction SilentlyContinue
+            $maxNumber = 0
+            if ($existingEntries) {
+                $existingEntries.PSObject.Properties | Where-Object {$_.Name -match '^\d+$'} | ForEach-Object {
+                    $num = [int]$_.Name
+                    if ($num -gt $maxNumber) { $maxNumber = $num }
+                }
+            }
+            $nextNumber = $maxNumber + 1
+            
+            # Check if Tampermonkey is already installed
+            $alreadyInstalled = $false
+            if ($existingEntries) {
+                $existingEntries.PSObject.Properties | Where-Object {$_.Value -like "*$tampermonkeyChrome*"} | ForEach-Object {
+                    $alreadyInstalled = $true
+                }
+            }
+            
+            if (-not $alreadyInstalled) {
+                # Add Tampermonkey to force install list
+                Set-ItemProperty -Path $forcelistPath -Name $nextNumber.ToString() -Value "$tampermonkeyChrome;$tampermonkeyUpdateURL" -Type String
+                Write-Host "  [+] Added Tampermonkey to $($browser.Name)" -ForegroundColor Green
+            } else {
+                Write-Host "  [=] Tampermonkey already configured for $($browser.Name)" -ForegroundColor Yellow
+            }
+            
+        } catch {
+            Write-Host "  [-] Failed to configure $($browser.Name): $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    
+    # Firefox-based browsers
+    $firefoxBrowsers = @(
+        @{Name="Mozilla\Firefox"; Path="HKLM:\Software\Policies\Mozilla\Firefox"},
+        @{Name="Mozilla\Zen"; Path="HKLM:\Software\Policies\Mozilla\Zen"}
+    )
+    
+    $tampermonkeyFirefox = @{
+        id = "firefox@tampermonkey.net"
+        installUrl = "https://addons.mozilla.org/firefox/downloads/latest/tampermonkey/latest.xpi"
+    }
+    
+    foreach ($browser in $firefoxBrowsers) {
+        try {
+            if (-not (Test-Path $browser.Path)) {
+                New-Item -Path $browser.Path -Force | Out-Null
+            }
+            
+            # Get existing ExtensionSettings
+            $extensionSettings = Get-ItemProperty -Path $browser.Path -Name "ExtensionSettings" -ErrorAction SilentlyContinue
+            
+            if ($extensionSettings) {
+                $settings = $extensionSettings.ExtensionSettings | ConvertFrom-Json
+                
+                # Check if Tampermonkey already exists
+                if (-not $settings.PSObject.Properties[$tampermonkeyFirefox.id]) {
+                    # Add Tampermonkey
+                    $settings | Add-Member -NotePropertyName $tampermonkeyFirefox.id -NotePropertyValue @{
+                        installation_mode = "force_installed"
+                        install_url = $tampermonkeyFirefox.installUrl
+                    } -Force
+                    
+                    $newSettings = $settings | ConvertTo-Json -Compress -Depth 10
+                    Set-ItemProperty -Path $browser.Path -Name "ExtensionSettings" -Value $newSettings -Type String
+                    Write-Host "  [+] Added Tampermonkey to $($browser.Name)" -ForegroundColor Green
+                } else {
+                    Write-Host "  [=] Tampermonkey already configured for $($browser.Name)" -ForegroundColor Yellow
+                }
+            } else {
+                # Create new ExtensionSettings with Tampermonkey
+                $newSettings = @{
+                    $tampermonkeyFirefox.id = @{
+                        installation_mode = "force_installed"
+                        install_url = $tampermonkeyFirefox.installUrl
+                    }
+                } | ConvertTo-Json -Compress -Depth 10
+                
+                Set-ItemProperty -Path $browser.Path -Name "ExtensionSettings" -Value $newSettings -Type String
+                Write-Host "  [+] Added Tampermonkey to $($browser.Name)" -ForegroundColor Green
+            }
+            
+        } catch {
+            Write-Host "  [-] Failed to configure $($browser.Name): $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    
+    Write-Host "`n[YouTube Ad Blocker] Tampermonkey installation configured!" -ForegroundColor Green
+    Write-Host "  Note: Close and reopen your browser for changes to take effect." -ForegroundColor Yellow
+}
 
-    $Port = 8080
-    $results = @()
+function Install-YouTubeAdBlockerUserscript {
+    <#
+    .SYNOPSIS
+    Creates YouTube ad blocking userscript for Tampermonkey
+    #>
+    
+    Write-Host "[YouTube Ad Blocker] Creating YouTube ad blocking userscript..." -ForegroundColor Cyan
+    
+    # Create Tampermonkey scripts directory
+    $tampermonkeyDir = "$env:APPDATA\Tampermonkey"
+    if (-not (Test-Path $tampermonkeyDir)) {
+        New-Item -ItemType Directory -Path $tampermonkeyDir -Force | Out-Null
+    }
+    
+    # YouTube Ad Blocker Userscript
+    $userscript = @"
+// ==UserScript==
+// @name         YouTube Advanced Ad Blocker
+// @namespace    http://tampermonkey.net/
+// @version      2.1
+// @description  Comprehensive YouTube ad blocking
+// @author       Security Script
+// @match        https://www.youtube.com/*
+// @match        https://m.youtube.com/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
 
-    try {
-        # First, set up hosts file blocking
-        Set-HostsFileBlock
-        $results += "[YouTubeAdBlocker] Hosts file configured for ad blocking"
-
-        # Check if proxy is already running
-        $existingJob = Get-Job -Name "YouTubeAdBlockerProxy" -ErrorAction SilentlyContinue
-
-        if ($existingJob -and $existingJob.State -eq 'Running') {
-            $results += "[YouTubeAdBlocker] YouTube proxy already running on port $Port"
-        } else {
-            # Clean up existing job
-            Get-Job -Name "YouTubeAdBlockerProxy" -ErrorAction SilentlyContinue | Remove-Job -Force
-
-            # Start YouTube proxy
-            $proxyJob = Start-Job -Name "YouTubeAdBlockerProxy" -ScriptBlock {
-                param($Port)
-
-                $ErrorActionPreference = "Continue"
-
-                # YouTube-specific JavaScript injection
-                $YouTubeScriptlet = @"
-<script>
 (function() {
     'use strict';
-    console.log('[YT-AdBlock] Active');
-    if (window.ytInitialPlayerResponse) {
-        try {
-            if (window.ytInitialPlayerResponse.adPlacements) window.ytInitialPlayerResponse.adPlacements = [];
-            if (window.ytInitialPlayerResponse.playerAds) window.ytInitialPlayerResponse.playerAds = [];
-        } catch(e) {}
-    }
-    Object.defineProperty(window, 'ytInitialPlayerResponse', {
-        set: function(v) { if(v && typeof v === 'object') { v.adPlacements = []; v.playerAds = []; } this._ytInitialPlayerResponse = v; },
-        get: function() { return this._ytInitialPlayerResponse; }
-    });
-    const removeAds = () => {
-        ['.video-ads','.ytp-ad-module','.ytp-ad-overlay-container','ytd-display-ad-renderer','ytd-promoted-sparkles-web-renderer','#masthead-ad','.ytd-compact-promoted-item-renderer','ytd-ad-slot-renderer','yt-mealbar-promo-renderer','ytd-popup-container'].forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
-        const skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern');
-        if (skipBtn) skipBtn.click();
-        const video = document.querySelector('video.html5-main-video');
-        const adIndicator = document.querySelector('.ytp-ad-player-overlay');
-        if (video && adIndicator) video.currentTime = video.duration;
+    
+    // Block ad requests at network level
+    const originalFetch = window.fetch;
+    window.fetch = function(...args) {
+        const url = args[0];
+        if (typeof url === 'string' && (
+            url.includes('doubleclick.net') ||
+            url.includes('googlesyndication.com') ||
+            url.includes('googleadservices.com') ||
+            url.includes('/get_midroll_') ||
+            url.includes('/get_video_info') && url.includes('adformat') ||
+            url.includes('/api/stats/ads') ||
+            url.includes('/pagead/') ||
+            url.includes('/pcs/click') ||
+            url.includes('/ad_')
+        )) {
+            return Promise.reject(new Error('Ad blocked'));
+        }
+        return originalFetch.apply(this, args);
     };
+    
+    // Block XMLHttpRequest ads
+    const originalOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        if (typeof url === 'string' && (
+            url.includes('doubleclick.net') ||
+            url.includes('googlesyndication.com') ||
+            url.includes('/get_midroll_') ||
+            url.includes('/pagead/')
+        )) {
+            return;
+        }
+        return originalOpen.call(this, method, url, ...rest);
+    };
+    
+    // Remove ad elements from DOM
+    function removeAds() {
+        // Video ads
+        const adSelectors = [
+            '.video-ads',
+            '.ytp-ad-module',
+            '.ytp-ad-overlay-container',
+            '.ytp-ad-text-overlay',
+            'ytd-promoted-sparkles-web-renderer',
+            'ytd-display-ad-renderer',
+            'ytd-video-masthead-ad-renderer',
+            'ytd-promoted-video-renderer',
+            'ytd-compact-promoted-video-renderer',
+            'ytd-ad-slot-renderer',
+            'ytd-in-feed-ad-layout-renderer',
+            'ytd-banner-promo-renderer',
+            '#masthead-ad',
+            '.ytd-mealbar-promo-renderer',
+            'ytd-statement-banner-renderer',
+            '.ytd-search-pyv-renderer',
+            'ytm-promoted-video-renderer',
+            'ytm-promoted-sparkles-web-renderer'
+        ];
+        
+        adSelectors.forEach(selector => {
+            document.querySelectorAll(selector).forEach(el => el.remove());
+        });
+        
+        // Skip ad buttons
+        const skipButton = document.querySelector('.ytp-ad-skip-button, .ytp-skip-ad-button');
+        if (skipButton) skipButton.click();
+        
+        // Remove ad container attributes
+        const player = document.querySelector('.html5-video-player');
+        if (player && player.classList.contains('ad-showing')) {
+            player.classList.remove('ad-showing');
+        }
+    }
+    
+    // Continuous monitoring
     setInterval(removeAds, 500);
-    new MutationObserver(removeAds).observe(document.body, { childList: true, subtree: true });
+    
+    // Observer for dynamic content
+    const observer = new MutationObserver(removeAds);
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+    
+    // Remove ads on page load
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', removeAds);
+    } else {
+        removeAds();
+    }
+    
+    // Override ad config
+    window.ytInitialData = new Proxy(window.ytInitialData || {}, {
+        get(target, prop) {
+            if (prop === 'playerAds' || prop === 'adPlacements' || prop === 'adSlots') {
+                return [];
+            }
+            return target[prop];
+        }
+    });
+    
+    console.log('[YouTube Ad Blocker] Active - Ads blocked');
 })();
-</script>
 "@
-
-                function Inject-YouTubeScript {
-                    param([string]$HtmlContent)
-                    if ($HtmlContent -match '</head>') {
-                        return $HtmlContent -replace '</head>', "$YouTubeScriptlet</head>"
-                    } elseif ($HtmlContent -match '<body[^>]*>') {
-                        return $HtmlContent -replace '(<body[^>]*>)', "`$1$YouTubeScriptlet"
-                    }
-                    return $HtmlContent
-                }
-
-                function Handle-Request {
-                    param($Context)
-                    $request = $Context.Request
-                    $response = $Context.Response
-
-                    try {
-                        $method = $request.HttpMethod
-                        $requestUrl = $request.RawUrl
-                        $hostHeader = $request.Headers['Host']
-
-                        # Only handle YouTube domains
-                        if ($hostHeader -and ($hostHeader -like '*youtube*' -or $hostHeader -like '*youtu.be*')) {
-                            $targetUrl = "https://$hostHeader$requestUrl"
-
-                            $webRequest = [System.Net.HttpWebRequest]::Create($targetUrl)
-                            $webRequest.Method = $method
-                            $webRequest.UserAgent = $request.UserAgent
-                            $webRequest.Timeout = 30000
-
-                            foreach ($header in $request.Headers.AllKeys) {
-                                if ($header -notin @('Host', 'Connection', 'Proxy-Connection', 'Content-Length')) {
-                                    try { $webRequest.Headers.Add($header, $request.Headers[$header]) } catch {}
-                                }
-                            }
-
-                            if ($method -in @('POST', 'PUT', 'PATCH') -and $request.HasEntityBody) {
-                                $webRequest.ContentLength = $request.ContentLength64
-                                $webRequest.ContentType = $request.ContentType
-                                $requestStream = $webRequest.GetRequestStream()
-                                $request.InputStream.CopyTo($requestStream)
-                                $requestStream.Close()
-                            }
-
-                            try {
-                                $webResponse = $webRequest.GetResponse()
-                            } catch [System.Net.WebException] {
-                                $webResponse = $_.Exception.Response
-                                if ($null -eq $webResponse) { throw }
-                            }
-
-                            $response.StatusCode = [int]$webResponse.StatusCode
-                            $response.StatusDescription = $webResponse.StatusDescription
-
-                            foreach ($header in $webResponse.Headers.AllKeys) {
-                                if ($header -notin @('Transfer-Encoding', 'Content-Length')) {
-                                    try { $response.Headers.Add($header, $webResponse.Headers[$header]) } catch {}
-                                }
-                            }
-
-                            $responseStream = $webResponse.GetResponseStream()
-                            $reader = New-Object System.IO.StreamReader($responseStream)
-                            $content = $reader.ReadToEnd()
-                            $reader.Close()
-                            $responseStream.Close()
-                            $webResponse.Close()
-
-                            if ($webResponse.ContentType -like "*text/html*") {
-                                $content = Inject-YouTubeScript -HtmlContent $content
-                            }
-
-                            $buffer = [System.Text.Encoding]::UTF8.GetBytes($content)
-                            $response.ContentLength64 = $buffer.Length
-                            $response.OutputStream.Write($buffer, 0, $buffer.Length)
-                            $response.Close()
-
-                        } else {
-                            # For non-YouTube requests, return error to force direct connection
-                            $response.StatusCode = 502
-                            $response.Close()
-                        }
-
-                    } catch {
-                        try {
-                            $response.StatusCode = 502
-                            $response.Close()
-                        } catch {}
-                    }
-                }
-
-                $listener = New-Object System.Net.HttpListener
-                $listener.Prefixes.Add("http://localhost:$Port/")
-
-                try {
-                    $listener.Start()
-                    while ($listener.IsListening) {
-                        $context = $listener.GetContext()
-                        Handle-Request -Context $context
-                    }
-                } catch {
-                } finally {
-                    if ($listener.IsListening) { $listener.Stop() }
-                    $listener.Close()
-                }
-            } -ArgumentList $Port
-
-            Start-Sleep -Milliseconds 500
-            $results += "[YouTubeAdBlocker] YouTube proxy started on port $Port"
-        }
-
-        # Create simplified PAC file
-        $pacFile = "$env:TEMP\youtube-adblocker.pac"
-        $pacContent = @'
-function FindProxyForURL(url, host) {
-    host = host.toLowerCase();
-    url = url.toLowerCase();
     
-    // Local network bypass
-    if (isPlainHostName(host) ||
-        shExpMatch(host, "10.*") ||
-        shExpMatch(host, "172.16.*") ||
-        shExpMatch(host, "192.168.*") ||
-        shExpMatch(host, "127.*") ||
-        dnsDomainIs(host, ".local")) {
-        return "DIRECT";
-    }
+    $scriptPath = Join-Path $tampermonkeyDir "youtube-adblocker.user.js"
+    $userscript | Out-File -FilePath $scriptPath -Encoding UTF8 -Force
     
-    // Route YouTube through JS injection proxy
-    if (shExpMatch(host, "*.youtube.com") ||
-        shExpMatch(host, "*.youtu.be") ||
-        host === "youtube.com" ||
-        host === "youtu.be") {
-        return "PROXY 127.0.0.1:8080";
-    }
+    Write-Host "  [+] Userscript created: $scriptPath" -ForegroundColor Green
+    Write-Host "`n[YouTube Ad Blocker] Installation complete!" -ForegroundColor Green
+    Write-Host "  1. Close all browsers" -ForegroundColor Yellow
+    Write-Host "  2. Reopen your browser (Tampermonkey will auto-install)" -ForegroundColor Yellow
+    Write-Host "  3. Click the Tampermonkey icon and enable the YouTube Ad Blocker script" -ForegroundColor Yellow
+    Write-Host "  4. Visit youtube.com - ads will be blocked!" -ForegroundColor Yellow
     
-    // Whitelist important domains
-    var whitelist = [
-        "twitter.com", "x.com", "perplexity.ai", "mediafire.com",
-        "apple.com", "citibank.com", "ebay.com", "yahoo.com",
-        "discord.com", "discordapp.com", "cdn.discordapp.com",
-        "discord.gg", "discordcdn.com", "aliexpress.com",
-        "tenor.com", "media.tenor.com"
-    ];
-    
-    for (var i = 0; i < whitelist.length; i++) {
-        if (shExpMatch(host, whitelist[i]) || dnsDomainIs(host, whitelist[i])) {
-            return "DIRECT";
-        }
-    }
-    
-    // Everything else uses hosts file blocking (DIRECT)
-    return "DIRECT";
+    return $scriptPath
 }
-'@
 
-        Set-Content -Path $pacFile -Value $pacContent -Encoding ASCII -ErrorAction Stop
-
-        # Configure system to use PAC file
-        $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-        Set-ItemProperty -Path $regPath -Name AutoConfigURL -Value "file:///$($pacFile -replace '\\','/')" -ErrorAction Stop
-        Set-ItemProperty -Path $regPath -Name ProxyEnable -Value 0 -ErrorAction Stop
-
-        # Refresh proxy settings
-        try {
-            $signature = @'
-[DllImport("wininet.dll", SetLastError = true, CharSet=CharSet.Auto)]
-public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
-'@
-            $wininet = Add-Type -MemberDefinition $signature -Name InternetSettings -Namespace Win32 -PassThru
-            $wininet::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
-            $wininet::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
-        } catch {}
-
-        $results += "[YouTubeAdBlocker] PAC file configured for hybrid blocking"
-        $results += "[YouTubeAdBlocker] YouTube traffic: JS injection proxy (port 8080)"
-        $results += "[YouTubeAdBlocker] Other ads: Hosts file blocking"
-        $results += "[YouTubeAdBlocker] Restart browser for full effect"
-
+function Invoke-YouTubeAdBlocker {
+    <#
+    .SYNOPSIS
+    Main function for YouTube ad blocking via Tampermonkey
+    #>
+    
+    try {
+        $timestamp = Get-Date
+        
+        # Install Tampermonkey via registry
+        Install-TampermonkeyViaRegistry
+        
+        # Create userscript
+        $scriptPath = Install-YouTubeAdBlockerUserscript
+        
+        # Add YouTube ad domains to hosts file for additional blocking
+        $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+        $adDomains = @(
+            "googlevideo.com",
+            "doubleclick.net",
+            "googleadservices.com",
+            "googlesyndication.com"
+        )
+        
+        $hostsContent = Get-Content $hostsPath -ErrorAction SilentlyContinue
+        $modified = $false
+        
+        foreach ($domain in $adDomains) {
+            $entry = "0.0.0.0 $domain"
+            if ($hostsContent -notcontains $entry) {
+                Add-Content -Path $hostsPath -Value $entry -Force
+                $modified = $true
+            }
+        }
+        
+        if ($modified) {
+            Write-Host "`n[YouTube Ad Blocker] Added YouTube ad domains to hosts file" -ForegroundColor Green
+            # Flush DNS cache
+            ipconfig /flushdns | Out-Null
+        }
+        
+        Write-Host "`n[YouTube Ad Blocker] Next check: $((Get-Date).AddMinutes(60).ToString('HH:mm:ss'))" -ForegroundColor Cyan
+        
     } catch {
-        $results += "[YouTubeAdBlocker] ERROR: $($_.Exception.Message)"
+        Write-Host "[YouTube Ad Blocker] Error: $($_.Exception.Message)" -ForegroundColor Red
     }
-
-    return $results
 }
-
-
 
 # ===================== Main =====================
 
@@ -2316,7 +2595,8 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "NamedPipeMonitoring",
         "DNSExfiltrationDetection",
         "PasswordManagement",
-        "YouTubeAdBlocker"
+        "YouTubeAdBlocker",
+	    "WebcamGuardian"
     )
 
     foreach ($modName in $moduleNames) {
