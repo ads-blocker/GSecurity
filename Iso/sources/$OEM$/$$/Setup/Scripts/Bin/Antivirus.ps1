@@ -2514,6 +2514,7 @@ function Invoke-YouTubeAdBlocker {
     }
 }
 
+
 # ===================== Main =====================
 
 try {
