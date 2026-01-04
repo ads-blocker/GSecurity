@@ -13,6 +13,11 @@ $Script:ScriptName = Split-Path -Leaf $PSCommandPath
 $Script:MaxRestartAttempts = 3
 $Script:StabilityLogPath = "$Script:InstallPath\Logs\stability_log.txt"
 
+$quarantineFolder = "C:\ProgramData\AntivirusProtection\Quarantine"
+$logFile = "$quarantineFolder\antivirus_log.txt"
+$localDatabase = "$quarantineFolder\scanned_files.txt"
+$scannedFiles = @{} # Initialize empty hash table
+
 $Script:ManagedJobConfig = @{
     HashDetectionIntervalSeconds = 15
     LOLBinDetectionIntervalSeconds = 15
@@ -2514,7 +2519,261 @@ function Invoke-YouTubeAdBlocker {
     }
 }
 
-
+# Load or Reset Scanned Files Database
+if (Test-Path $localDatabase) {
+    try {
+        $scannedFiles.Clear() # Reset hash table before loading
+        $lines = Get-Content $localDatabase -ErrorAction Stop
+        foreach ($line in $lines) {
+            if ($line -match "^([0-9a-f]{64}),(true|false)$") {
+                $scannedFiles[$matches[1]] = [bool]$matches[2]
+            }
+        }
+        Write-AVLog "Loaded $($scannedFiles.Count) scanned file entries from database."
+    } catch {
+        Write-AVLog "Failed to load database: $($_.Exception.Message)"
+        $scannedFiles.Clear() # Reset on failure
+    }
+} else {
+    $scannedFiles.Clear() # Ensure reset if no database
+    New-Item -Path $localDatabase -ItemType File -Force -ErrorAction Stop | Out-Null
+    Write-AVLog "Created new database: $localDatabase"
+}
+ 
+# Take Ownership and Modify Permissions (Aggressive)
+function Set-FileOwnershipAndPermissions {
+    param ([string]$filePath)
+    try {
+        takeown /F $filePath /A | Out-Null
+        icacls $filePath /reset | Out-Null
+        icacls $filePath /grant "Administrators:F" /inheritance:d | Out-Null
+        Write-AVLog "Forcibly set ownership and permissions for $filePath"
+        return $true
+    } catch {
+        Write-AVLog "Failed to set ownership/permissions for ${filePath}: $($_.Exception.Message)"
+        return $false
+    }
+}
+ 
+# Calculate File Hash and Signature
+function Calculate-FileHash {
+    param ([string]$filePath)
+    try {
+        $signature = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction Stop
+        $hash = Get-FileHash -Path $filePath -Algorithm SHA256 -ErrorAction Stop
+        Write-AVLog "Signature status for ${filePath}: $($signature.Status) - $($signature.StatusMessage)"
+        return [PSCustomObject]@{
+            Hash = $hash.Hash.ToLower()
+            Status = $signature.Status
+            StatusMessage = $signature.StatusMessage
+        }
+    } catch {
+        Write-AVLog "Error processing ${filePath}: $($_.Exception.Message)"
+        return $null
+    }
+}
+ 
+# Quarantine File (Crash-Proof)
+function Quarantine-File {
+    param ([string]$filePath)
+    try {
+        $quarantinePath = Join-Path -Path $quarantineFolder -ChildPath (Split-Path $filePath -Leaf)
+        Move-Item -Path $filePath -Destination $quarantinePath -Force -ErrorAction Stop
+        Write-AVLog "Quarantined file: $filePath to $quarantinePath"
+    } catch {
+        Write-AVLog "Failed to quarantine ${filePath}: $($_.Exception.Message)"
+    }
+}
+ 
+# Stop Processes Using DLL (Aggressive)
+function Stop-ProcessUsingDLL {
+    param ([string]$filePath)
+    try {
+        $processes = Get-Process | Where-Object { ($_.Modules | Where-Object { $_.FileName -eq $filePath }) }
+        foreach ($process in $processes) {
+            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+            Write-AVLog "Stopped process $($process.Name) (PID: $($process.Id)) using $filePath"
+        }
+    } catch {
+        Write-AVLog "Error stopping processes for ${filePath}: $($_.Exception.Message)"
+        try {
+            $processes = Get-Process | Where-Object { ($_.Modules | Where-Object { $_.FileName -eq $filePath }) }
+            foreach ($process in $processes) {
+                taskkill /PID $process.Id /F | Out-Null
+                Write-AVLog "Force-killed process $($process.Name) (PID: $($process.Id)) using taskkill"
+            }
+        } catch {
+            Write-AVLog "Fallback process kill failed for ${filePath}: $($_.Exception.Message)"
+        }
+    }
+}
+ 
+function Should-ExcludeFile {
+    param ([string]$filePath)
+    $lowerPath = $filePath.ToLower()
+    
+    # Exclude assembly folders
+    if ($lowerPath -like "*\assembly\*") {
+        Write-AVLog "Excluding assembly folder file: $filePath"
+        return $true
+    }
+    
+    # Exclude ctfmon-related files
+    if ($lowerPath -like "*ctfmon*" -or $lowerPath -like "*msctf.dll" -or $lowerPath -like "*msutb.dll") {
+        Write-AVLog "Excluding ctfmon-related file: $filePath"
+        return $true
+    }
+    
+    return $false
+}
+ 
+# Remove Unsigned DLLs (Exclude Problem Folders)
+function Remove-UnsignedDLLs {
+    Write-AVLog "Starting unsigned DLL/WINMD scan."
+    $drives = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DriveType -in (2, 3, 4) }
+    foreach ($drive in $drives) {
+        $root = $drive.DeviceID + "\"
+        Write-AVLog "Scanning drive: $root"
+        try {
+            $dllFiles = Get-ChildItem -Path $root -Include *.dll,*.winmd -Recurse -File -Exclude @($quarantineFolder, "C:\Windows\System32\config") -ErrorAction Stop
+            foreach ($dll in $dllFiles) {
+                try {
+                    if (Should-ExcludeFile -filePath $dll.FullName) {
+                        continue
+                    }
+                    
+                    $fileHash = Calculate-FileHash -filePath $dll.FullName
+                    if ($fileHash) {
+                        if ($scannedFiles.ContainsKey($fileHash.Hash)) {
+                            Write-AVLog "Skipping already scanned file: $($dll.FullName) (Hash: $($fileHash.Hash))"
+                            if (-not $scannedFiles[$fileHash.Hash]) {
+                                if (Set-FileOwnershipAndPermissions -filePath $dll.FullName) {
+                                    Stop-ProcessUsingDLL -filePath $dll.FullName
+                                    Quarantine-File -filePath $dll.FullName
+                                }
+                            }
+                        } else {
+                            $isValid = $fileHash.Status -eq "Valid" # Only "Valid" is safe
+                            $scannedFiles[$fileHash.Hash] = $isValid
+                            "$($fileHash.Hash),$isValid" | Out-File -FilePath $localDatabase -Append -Encoding UTF8 -ErrorAction Stop
+                            Write-AVLog "Scanned new file: $($dll.FullName) (Valid: $isValid)"
+                            if (-not $isValid) {
+                                if (Set-FileOwnershipAndPermissions -filePath $dll.FullName) {
+                                    Stop-ProcessUsingDLL -filePath $dll.FullName
+                                    Quarantine-File -filePath $dll.FullName
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    Write-AVLog "Error processing file $($dll.FullName): $($_.Exception.Message)"
+                }
+            }
+        } catch {
+            Write-AVLog "Scan failed for drive ${root} $($_.Exception.Message)"
+        }
+    }
+    # Explicit System32 Scan
+    Write-AVLog "Starting explicit System32 scan."
+    try {
+        $system32Files = Get-ChildItem -Path "C:\Windows\System32" -Include *.dll,*.winmd -File -ErrorAction Stop
+        foreach ($dll in $system32Files) {
+            try {
+                if (Should-ExcludeFile -filePath $dll.FullName) {
+                    continue
+                }
+                
+                $fileHash = Calculate-FileHash -filePath $dll.FullName
+                if ($fileHash) {
+                    if ($scannedFiles.ContainsKey($fileHash.Hash)) {
+                        Write-AVLog "Skipping already scanned System32 file: $($dll.FullName) (Hash: $($fileHash.Hash))"
+                        if (-not $scannedFiles[$fileHash.Hash]) {
+                            if (Set-FileOwnershipAndPermissions -filePath $dll.FullName) {
+                                Stop-ProcessUsingDLL -filePath $dll.FullName
+                                Quarantine-File -filePath $dll.FullName
+                            }
+                        }
+                    } else {
+                        $isValid = $fileHash.Status -eq "Valid"
+                        $scannedFiles[$fileHash.Hash] = $isValid
+                        "$($fileHash.Hash),$isValid" | Out-File -FilePath $localDatabase -Append -Encoding UTF8 -ErrorAction Stop
+                        Write-AVLog "Scanned new System32 file: $($dll.FullName) (Valid: $isValid)"
+                        if (-not $isValid) {
+                            if (Set-FileOwnershipAndPermissions -filePath $dll.FullName) {
+                                Stop-ProcessUsingDLL -filePath $dll.FullName
+                                Quarantine-File -filePath $dll.FullName
+                            }
+                        }
+                    }
+                }
+            } catch {
+                Write-AVLog "Error processing System32 file $($dll.FullName): $($_.Exception.Message)"
+            }
+        }
+    } catch {
+        Write-AVLog "System32 scan failed: $($_.Exception.Message)"
+    }
+}
+ 
+# File System Watcher (Throttled and Crash-Proof)
+$drives = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DriveType -in (2, 3, 4) }
+foreach ($drive in $drives) {
+    $monitorPath = $drive.DeviceID + "\"
+    try {
+        $fileWatcher = New-Object System.IO.FileSystemWatcher
+        $fileWatcher.Path = $monitorPath
+        $fileWatcher.Filter = "*.*"
+        $fileWatcher.IncludeSubdirectories = $true
+        $fileWatcher.EnableRaisingEvents = $true
+        $fileWatcher.NotifyFilter = [System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::LastWrite
+ 
+        $action = {
+            param($sender, $e)
+            try {
+                if ($e.ChangeType -in "Created", "Changed" -and $e.FullPath -notlike "$quarantineFolder*" -and ($e.FullPath -like "*.dll" -or $e.FullPath -like "*.winmd")) {
+                    if (Should-ExcludeFile -filePath $e.FullPath) {
+                        return
+                    }
+                    
+                    Write-AVLog "Detected file change: $($e.FullPath)"
+                    $fileHash = Calculate-FileHash -filePath $e.FullPath
+                    if ($fileHash) {
+                        if ($scannedFiles.ContainsKey($fileHash.Hash)) {
+                            Write-AVLog "Skipping already scanned file: $($e.FullPath) (Hash: $($fileHash.Hash))"
+                            if (-not $scannedFiles[$fileHash.Hash]) {
+                                if (Set-FileOwnershipAndPermissions -filePath $e.FullPath) {
+                                    Stop-ProcessUsingDLL -filePath $e.FullPath
+                                    Quarantine-File -filePath $e.FullPath
+                                }
+                            }
+                        } else {
+                            $isValid = $fileHash.Status -eq "Valid"
+                            $scannedFiles[$fileHash.Hash] = $isValid
+                            "$($fileHash.Hash),$isValid" | Out-File -FilePath $localDatabase -Append -Encoding UTF8 -ErrorAction Stop
+                            Write-AVLog "Added new file to database: $($e.FullPath) (Valid: $isValid)"
+                            if (-not $isValid) {
+                                if (Set-FileOwnershipAndPermissions -filePath $e.FullPath) {
+                                    Stop-ProcessUsingDLL -filePath $e.FullPath
+                                    Quarantine-File -filePath $e.FullPath
+                                }
+                            }
+                        }
+                    }
+                    Start-Sleep -Milliseconds 500 # Throttle to prevent event flood
+                }
+            } catch {
+                Write-AVLog "Watcher error for $($e.FullPath): $($_.Exception.Message)"
+            }
+        }
+ 
+        Register-ObjectEvent -InputObject $fileWatcher -EventName Created -Action $action -ErrorAction Stop
+        Register-ObjectEvent -InputObject $fileWatcher -EventName Changed -Action $action -ErrorAction Stop
+        Write-AVLog "FileSystemWatcher set up for $monitorPath"
+    } catch {
+        Write-AVLog "Failed to set up watcher for ${monitorPath} $($_.Exception.Message)"
+    }
+}
+ 
 # ===================== Main =====================
 
 try {
@@ -2533,6 +2792,8 @@ try {
     Initialize-Mutex
 
     Register-TerminationProtection
+
+    Remove-UnsignedDLLs
 
 Write-Host "`n[PROTECTION] Initializing anti-termination safeguards..." -ForegroundColor Cyan
 
@@ -2598,7 +2859,7 @@ Write-Host "[PROTECTION] Anti-termination safeguards active" -ForegroundColor Gr
         "PasswordManagement",
         "YouTubeAdBlocker",
 	    "WebcamGuardian"
-    )
+)
 
     foreach ($modName in $moduleNames) {
         $key = "${modName}IntervalSeconds"
